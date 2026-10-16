@@ -16,7 +16,7 @@ use uc_observability_contract::diagnostics::connectivity::{
 use crate::clipboard::outbound::{
     ClipboardOutboundError, ClipboardOutboundInput, ClipboardOutboundOutcome,
 };
-use crate::clipboard::sync::sync_runtime::ClipboardSyncRuntime;
+use crate::clipboard::sync::sync_runtime::{ClipboardDeliveryIntent, ClipboardSyncRuntime};
 use crate::clipboard::write::LocalActiveRegisterAdvancer;
 use crate::facade::{
     CapturedClipboardEntryView, ClipboardCaptureFacadeError, ClipboardCapturePort,
@@ -103,6 +103,7 @@ pub(crate) trait LocalClipboardDispatchPort: Send + Sync {
         &self,
         input: ClipboardOutboundInput,
         targets: Option<Vec<DeviceId>>,
+        intent: ClipboardDeliveryIntent,
     ) -> Result<ClipboardOutboundOutcome, ClipboardOutboundError>;
 }
 
@@ -112,8 +113,9 @@ impl LocalClipboardDispatchPort for ClipboardSyncRuntime {
         &self,
         input: ClipboardOutboundInput,
         targets: Option<Vec<DeviceId>>,
+        intent: ClipboardDeliveryIntent,
     ) -> Result<ClipboardOutboundOutcome, ClipboardOutboundError> {
-        self.dispatch_local_capture_to_targets(input, targets).await
+        ClipboardSyncRuntime::dispatch_local_capture(self, input, targets, intent).await
     }
 }
 
@@ -212,6 +214,10 @@ impl LocalClipboardProcessor {
             }
         };
 
+        let delivery_intent = match &intent {
+            LocalClipboardIntent::ObservedHostChange { .. } => ClipboardDeliveryIntent::Automatic,
+            LocalClipboardIntent::ExplicitSend { .. } => ClipboardDeliveryIntent::Explicit,
+        };
         let target_filter = match &intent {
             LocalClipboardIntent::ObservedHostChange { .. } => None,
             LocalClipboardIntent::ExplicitSend { targets } if targets.is_empty() => None,
@@ -237,6 +243,7 @@ impl LocalClipboardProcessor {
                             origin,
                         },
                         target_filter,
+                        delivery_intent,
                     )
                     .await
                     .map_err(|source| LocalClipboardProcessError::Dispatch { source })?,
@@ -367,7 +374,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingDispatch(Mutex<Vec<Option<Vec<DeviceId>>>>);
+    struct RecordingDispatch(Mutex<Vec<(Option<Vec<DeviceId>>, ClipboardDeliveryIntent)>>);
 
     #[async_trait]
     impl LocalClipboardDispatchPort for RecordingDispatch {
@@ -375,8 +382,9 @@ mod tests {
             &self,
             _input: ClipboardOutboundInput,
             targets: Option<Vec<DeviceId>>,
+            intent: ClipboardDeliveryIntent,
         ) -> Result<ClipboardOutboundOutcome, ClipboardOutboundError> {
-            self.0.lock().unwrap().push(targets);
+            self.0.lock().unwrap().push((targets, intent));
             Ok(ClipboardOutboundOutcome::Skipped {
                 reason: "test".to_owned(),
             })
@@ -394,6 +402,7 @@ mod tests {
             &self,
             _input: ClipboardOutboundInput,
             _targets: Option<Vec<DeviceId>>,
+            _intent: ClipboardDeliveryIntent,
         ) -> Result<ClipboardOutboundOutcome, ClipboardOutboundError> {
             Err(ClipboardOutboundError::Internal(anyhow::anyhow!(
                 "test failure"
@@ -450,7 +459,10 @@ mod tests {
         assert!(completion.dispatch.is_some());
         assert_eq!(activation.0.load(Ordering::SeqCst), 1);
         assert_eq!(index.0.load(Ordering::SeqCst), 1);
-        assert_eq!(dispatch.0.lock().unwrap().as_slice(), &[None]);
+        assert_eq!(
+            dispatch.0.lock().unwrap().as_slice(),
+            &[(None, ClipboardDeliveryIntent::Automatic)]
+        );
         assert_eq!(events.0.lock().unwrap().len(), 1);
     }
 
@@ -486,7 +498,10 @@ mod tests {
         assert_eq!(activation.0.load(Ordering::SeqCst), 0);
         assert_eq!(events.0.lock().unwrap().len(), 0);
         assert_eq!(index.0.load(Ordering::SeqCst), 1);
-        assert_eq!(dispatch.0.lock().unwrap().as_slice(), &[Some(targets)]);
+        assert_eq!(
+            dispatch.0.lock().unwrap().as_slice(),
+            &[(Some(targets), ClipboardDeliveryIntent::Explicit)]
+        );
     }
 
     #[tokio::test]

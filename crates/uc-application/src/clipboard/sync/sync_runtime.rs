@@ -1,4 +1,4 @@
-//! Owns automatic clipboard delivery after local capture and peer recovery.
+//! 负责本机捕获后的自动、显式投递与对端恢复。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,8 +27,14 @@ use crate::deps::CurrentSpaceMemberScopePort;
 use crate::runtime_lifecycle::LifecycleError;
 use uc_observability_contract::uc_warn;
 
-/// 自动出站的完整生命周期。调用方只提交本地捕获；手动重发使用独立
-/// facade，离线恢复保持为本运行期的内部责任。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardDeliveryIntent {
+    Automatic,
+    Explicit,
+}
+
+/// 本机捕获出站的完整生命周期；历史重发使用独立 facade，
+/// 离线恢复保持为本运行期的内部责任。
 pub struct ClipboardSyncRuntime {
     outbound: Arc<dyn ClipboardOutboundPort>,
     settings: Arc<dyn SettingsPort>,
@@ -80,12 +86,12 @@ impl ClipboardSyncRuntime {
         }
     }
 
-    /// Sends a local capture through the complete automatic-delivery
-    /// lifecycle while allowing an explicit caller to narrow its targets.
-    pub async fn dispatch_local_capture_to_targets(
+    /// 按调用意图投递本机捕获，并保留显式目标筛选。
+    pub(crate) async fn dispatch_local_capture(
         &self,
         input: ClipboardOutboundInput,
         target_filter: Option<Vec<DeviceId>>,
+        intent: ClipboardDeliveryIntent,
     ) -> Result<ClipboardOutboundOutcome, ClipboardOutboundError> {
         let gate_observation =
             LocalWorkObservation::begin(LocalWorkStep::ClipboardDeliveryGateWait);
@@ -96,9 +102,9 @@ impl ClipboardSyncRuntime {
                 reason: "runtime_stopped".to_owned(),
             });
         }
-        if !automatic_sync_enabled(self.settings.as_ref()).await {
+        if !delivery_enabled(self.settings.as_ref(), intent).await {
             return Ok(ClipboardOutboundOutcome::Skipped {
-                reason: "automatic_sync_disabled".to_string(),
+                reason: "sync_disabled".to_string(),
             });
         }
         let entry_id = EntryId::from(input.entry_id.as_str());
@@ -120,7 +126,7 @@ impl ClipboardSyncRuntime {
     }
 }
 
-async fn automatic_sync_enabled(settings: &dyn SettingsPort) -> bool {
+async fn delivery_enabled(settings: &dyn SettingsPort, intent: ClipboardDeliveryIntent) -> bool {
     let observation = LocalWorkObservation::begin(LocalWorkStep::ClipboardSyncSettingsLoad);
     let result = settings.load().await;
     observation.finish(if result.is_ok() {
@@ -129,11 +135,14 @@ async fn automatic_sync_enabled(settings: &dyn SettingsPort) -> bool {
         LocalWorkOutcome::Error
     });
     match result {
-        Ok(settings) => settings.sync.sync_enabled && settings.sync.auto_sync_enabled,
+        Ok(settings) => {
+            settings.sync.sync_enabled
+                && (intent == ClipboardDeliveryIntent::Explicit || settings.sync.auto_sync_enabled)
+        }
         Err(_) => {
             uc_warn!(
                 error_kind = "settings_load",
-                "clipboard sync: automatic delivery skipped"
+                "clipboard sync: delivery skipped"
             );
             false
         }

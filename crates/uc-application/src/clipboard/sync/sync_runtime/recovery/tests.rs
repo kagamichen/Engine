@@ -27,6 +27,105 @@ use uc_core::{ClipboardChangeOrigin, SystemClipboardSnapshot};
 
 struct NeverDispatch;
 
+#[derive(Default)]
+struct CapturedOutbound(Mutex<Vec<Option<Vec<DeviceId>>>>);
+
+#[async_trait]
+impl ClipboardOutboundPort for CapturedOutbound {
+    async fn dispatch_capture(
+        &self,
+        _: ClipboardOutboundInput,
+        targets: Option<Vec<DeviceId>>,
+    ) -> Result<ClipboardOutboundOutcome, ClipboardOutboundError> {
+        self.0.lock().unwrap().push(targets);
+        Ok(ClipboardOutboundOutcome::Skipped {
+            reason: "outbound_reached".to_owned(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn explicit_delivery_ignores_only_the_automatic_switch() {
+    for sync_enabled in [false, true] {
+        for auto_sync_enabled in [false, true] {
+            for stopping in [false, true] {
+                for intent in [
+                    ClipboardDeliveryIntent::Automatic,
+                    ClipboardDeliveryIntent::Explicit,
+                ] {
+                    let deps = recovery_deps(
+                        auto_sync_enabled,
+                        Vec::new(),
+                        HashMap::new(),
+                        Arc::new(Deliveries {
+                            records: Mutex::new(HashMap::new()),
+                        }),
+                        Arc::new(RecordingDispatch {
+                            commands: Mutex::new(Vec::new()),
+                            result: DispatchResult::Delivered,
+                        }),
+                    );
+                    let outbound = Arc::new(CapturedOutbound::default());
+                    let runtime = ClipboardSyncRuntime {
+                        outbound: outbound.clone(),
+                        settings: Arc::new(FixedSettings {
+                            sync_enabled,
+                            auto_sync_enabled,
+                        }),
+                        inbound: tokio::sync::Mutex::new(None),
+                        delivery_gate: Arc::clone(&deps.delivery_gate),
+                        recovery: OfflineDeliveryRecovery {
+                            cancel: CancellationToken::new(),
+                            task: tokio::sync::Mutex::new(None),
+                            deps: Arc::new(deps),
+                        },
+                        stopping: AtomicBool::new(stopping),
+                        shutdown_result: tokio::sync::Mutex::new(None),
+                    };
+                    let targets = Some(vec![DeviceId::new("selected-peer")]);
+                    let outcome = runtime
+                        .dispatch_local_capture(
+                            ClipboardOutboundInput {
+                                entry_id: "entry".to_owned(),
+                                snapshot: SystemClipboardSnapshot {
+                                    representations: Vec::new(),
+                                    ts_ms: 0,
+                                    file_content_digests: Vec::new(),
+                                    file_set_v1_component: None,
+                                },
+                                origin: ClipboardChangeOrigin::LocalCapture,
+                            },
+                            targets.clone(),
+                            intent,
+                        )
+                        .await
+                        .unwrap();
+                    let allowed = !stopping
+                        && sync_enabled
+                        && (auto_sync_enabled || intent == ClipboardDeliveryIntent::Explicit);
+                    let expected = if stopping {
+                        "runtime_stopped"
+                    } else if allowed {
+                        "outbound_reached"
+                    } else {
+                        "sync_disabled"
+                    };
+                    assert_eq!(
+                        outcome,
+                        ClipboardOutboundOutcome::Skipped {
+                            reason: expected.to_owned()
+                        }
+                    );
+                    assert_eq!(
+                        *outbound.0.lock().unwrap(),
+                        if allowed { vec![targets] } else { vec![] }
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -122,7 +221,7 @@ async fn local_dispatch_records_real_delivery_gate_wait() {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     runtime
-        .dispatch_local_capture_to_targets(
+        .dispatch_local_capture(
             ClipboardOutboundInput {
                 entry_id: "entry".to_owned(),
                 snapshot: SystemClipboardSnapshot {
@@ -134,6 +233,7 @@ async fn local_dispatch_records_real_delivery_gate_wait() {
                 origin: ClipboardChangeOrigin::LocalCapture,
             },
             None,
+            ClipboardDeliveryIntent::Automatic,
         )
         .await
         .unwrap();
@@ -205,7 +305,7 @@ async fn shutdown_survives_waiter_cancellation_and_retains_both_worker_failures(
     assert!(!format!("{error:?} {error}").contains("PRIVATE"));
     assert!(Arc::ptr_eq(&error, &runtime.shutdown().await.unwrap_err()));
     let result = runtime
-        .dispatch_local_capture_to_targets(
+        .dispatch_local_capture(
             ClipboardOutboundInput {
                 entry_id: "entry".to_owned(),
                 snapshot: SystemClipboardSnapshot {
@@ -217,6 +317,7 @@ async fn shutdown_survives_waiter_cancellation_and_retains_both_worker_failures(
                 origin: ClipboardChangeOrigin::LocalCapture,
             },
             None,
+            ClipboardDeliveryIntent::Automatic,
         )
         .await
         .unwrap();

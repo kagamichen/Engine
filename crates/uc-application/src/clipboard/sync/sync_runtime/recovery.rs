@@ -12,7 +12,7 @@ use uc_core::ports::{
     PeerReachabilityPort, ReachabilityState, SettingsPort,
 };
 
-use super::automatic_sync_enabled;
+use super::{delivery_enabled, ClipboardDeliveryIntent};
 use crate::clipboard::outbound::{
     ClipboardOutboundFacade, NotResendableReason, ResendEntryError, ResendReport,
 };
@@ -182,7 +182,9 @@ async fn recover_for_target(
     target: DeviceId,
     cancel: &CancellationToken,
 ) {
-    if cancel.is_cancelled() || !automatic_sync_enabled(deps.settings.as_ref()).await {
+    if cancel.is_cancelled()
+        || !delivery_enabled(deps.settings.as_ref(), ClipboardDeliveryIntent::Automatic).await
+    {
         return;
     }
 
@@ -282,7 +284,9 @@ async fn recover_for_target(
             {
                 return;
             }
-            if !automatic_sync_enabled(deps.settings.as_ref()).await || cancel.is_cancelled() {
+            if !delivery_enabled(deps.settings.as_ref(), ClipboardDeliveryIntent::Automatic).await
+                || cancel.is_cancelled()
+            {
                 return;
             }
             match deps

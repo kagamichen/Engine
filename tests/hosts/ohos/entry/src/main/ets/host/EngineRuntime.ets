@@ -1,5 +1,5 @@
 import engine from 'libuc_ohos_napi.so';
-import type { OhEngine, OhMemberRemoval, OhStartupLifecycle } from 'libuc_ohos_napi.so';
+import type { OhEngine, OhStartupLifecycle } from 'libuc_ohos_napi.so';
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
 import { picker } from '@kit.CoreFileKit';
@@ -16,8 +16,7 @@ export interface EngineRuntimeSnapshot {
   status: string;
   details: string;
   ready: boolean;
-  convergenceState: string;
-  memberRemovalState: string;
+  deviceCount: number;
 }
 
 class EngineRuntime {
@@ -31,8 +30,7 @@ class EngineRuntime {
   private version: string = 'Loading';
   private status: string = 'Checking unified core';
   private details: string = '';
-  private convergenceState: string = 'complete';
-  private memberRemovalState: string = 'none';
+  private deviceCount: number = 0;
 
   async start(context: common.UIAbilityContext): Promise<EngineRuntimeSnapshot> {
     if (this.activeEngine !== undefined || this.startupLifecycle !== undefined) {
@@ -78,8 +76,7 @@ class EngineRuntime {
           'system-host-acceptance'
         )).selfDeviceId;
       }
-      this.convergenceState = (await active.queryMembershipConvergence()).state;
-      this.applyMemberRemoval(await active.queryMemberRemoval());
+    this.deviceCount = (await active.listDevices()).length;
       this.activeEngine = active;
       this.startupLifecycle = undefined;
       this.status = 'Ready';
@@ -161,12 +158,12 @@ class EngineRuntime {
     }
   }
 
-  async queryCurrentMemberRemoval(): Promise<EngineRuntimeSnapshot> {
+  async queryDevices(): Promise<EngineRuntimeSnapshot> {
     const active = this.activeEngine;
     if (active === undefined) {
       throw new Error('OHOS_ENGINE_NOT_READY');
     }
-    this.applyMemberRemoval(await active.queryMemberRemoval());
+    this.deviceCount = (await active.listDevices()).length;
     return this.snapshot();
   }
 
@@ -176,8 +173,7 @@ class EngineRuntime {
       status: this.status,
       details: this.details,
       ready: this.activeEngine !== undefined && this.status === 'Ready',
-      convergenceState: this.convergenceState,
-      memberRemovalState: this.memberRemovalState
+      deviceCount: this.deviceCount
     };
   }
 
@@ -207,20 +203,9 @@ class EngineRuntime {
     if (recoveredIdentity !== this.identityDeviceId) {
       throw new Error('OHOS_IDENTITY_CHANGED');
     }
-    this.convergenceState = (await active.queryMembershipConvergence()).state;
-    this.applyMemberRemoval(await active.queryMemberRemoval());
+    this.deviceCount = (await active.listDevices()).length;
     this.status = 'Ready';
     this.details = '';
-  }
-
-  private applyMemberRemoval(removal: OhMemberRemoval): void {
-    this.memberRemovalState = JSON.stringify({
-      phase: removal.phase,
-      intentCount: removal.intentCount,
-      effectiveMemberCount: removal.effectiveMemberCount,
-      convergenceDigest: removal.convergenceDigest,
-      updatedAtMs: removal.updatedAtMs
-    });
   }
 
   private failLifecycle(action: string, error: Object): void {

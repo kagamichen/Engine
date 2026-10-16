@@ -30,3 +30,5 @@ Thumbs.db
 
 # PR Lens 的预览产物，按需重新生成。
 .pr-lens/
+
+__pycache__/

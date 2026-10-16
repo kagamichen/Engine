@@ -12,8 +12,7 @@ struct Index {
   @State private details: string = '';
   @State private ready: boolean = false;
   @State private exporting: boolean = false;
-  @State private convergenceState: string = 'complete';
-  @State private memberRemovalState: string = 'none';
+  @State private deviceCount: number = 0;
 
   aboutToAppear(): void {
     this.start().catch((error: Object) => this.fail(error));
@@ -29,8 +28,7 @@ struct Index {
     this.status = snapshot.status;
     this.details = snapshot.details;
     this.ready = snapshot.ready;
-    this.convergenceState = snapshot.convergenceState;
-    this.memberRemovalState = snapshot.memberRemovalState;
+    this.deviceCount = snapshot.deviceCount;
   }
 
   private fail(error: Object): void {
@@ -54,16 +52,16 @@ struct Index {
     }
   }
 
-  private async queryCurrentMemberRemoval(): Promise<void> {
+  private async queryDevices(): Promise<void> {
     if (!this.ready) {
       return;
     }
     try {
-      this.applySnapshot(await engineRuntime.queryCurrentMemberRemoval());
+      this.applySnapshot(await engineRuntime.queryDevices());
     } catch (error) {
       this.applySnapshot(engineRuntime.snapshot());
       this.details = String(error);
-      hilog.error(DOMAIN, 'EngineProbe', 'Member removal query failed: %{public}s', JSON.stringify(error));
+      hilog.error(DOMAIN, 'EngineProbe', 'Device query failed: %{public}s', JSON.stringify(error));
     }
   }
 
@@ -81,15 +79,11 @@ struct Index {
       Text(this.status)
         .fontSize(16)
         .fontColor(this.ready ? '#1F7A5A' : '#B3261E')
-      Text(this.convergenceState)
+      Text(`Devices: ${this.deviceCount}`)
         .fontSize(14)
-        .fontColor('#5B6570')
-      Text(this.memberRemovalState)
-        .fontSize(12)
-        .fontColor('#5B6570')
       if (this.ready) {
-        Button('Member removal')
-          .onClick(() => { void this.queryCurrentMemberRemoval(); })
+        Button('Refresh devices')
+          .onClick(() => { void this.queryDevices(); })
         Button(this.exporting ? 'Exporting' : 'Export sample')
           .enabled(!this.exporting)
           .onClick(() => { void this.exportSample(); })

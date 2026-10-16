@@ -1,4 +1,5 @@
 mod dispatch;
+mod file_export;
 mod host_clipboard;
 pub(crate) mod host_file;
 mod host_operations;

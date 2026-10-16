@@ -561,6 +561,10 @@ impl EngineRuntime for ProductionRuntime {
                     execute_resend_entry(self.current_facade().await?.as_ref(), input).await
                 }
                 Operation::ExportEntry(input) => self.execute_export_entry(input).await,
+                Operation::ExportEntryFiles(input) => {
+                    self.execute_export_entry_files(input, &cancellation, &session_cancellation)
+                        .await
+                }
             }
         };
         let result = if matches!(operation_kind, crate::OperationKind::ResetSpace) {

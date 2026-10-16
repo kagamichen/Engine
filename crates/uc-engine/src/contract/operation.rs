@@ -125,6 +125,7 @@ pub enum OperationKind {
     QueryActiveClipboard,
     RestoreClipboard,
     ExportEntry,
+    ExportEntryFiles,
     ResendEntry,
 }
 
@@ -231,6 +232,7 @@ impl fmt::Display for OperationKind {
             Self::QueryActiveClipboard => "query_active_clipboard",
             Self::RestoreClipboard => "restore_clipboard",
             Self::ExportEntry => "export_entry",
+            Self::ExportEntryFiles => "export_entry_files",
             Self::ResendEntry => "resend_entry",
         };
         formatter.write_str(value)
@@ -381,6 +383,7 @@ pub enum Operation {
     QueryActiveClipboard,
     RestoreClipboard(RestoreClipboardInput),
     ExportEntry(ExportEntryInput),
+    ExportEntryFiles(ExportEntryInput),
     ResendEntry(ResendEntryInput),
 }
 
@@ -489,6 +492,7 @@ impl Operation {
             Self::QueryActiveClipboard => OperationKind::QueryActiveClipboard,
             Self::RestoreClipboard(_) => OperationKind::RestoreClipboard,
             Self::ExportEntry(_) => OperationKind::ExportEntry,
+            Self::ExportEntryFiles(_) => OperationKind::ExportEntryFiles,
             Self::ResendEntry(_) => OperationKind::ResendEntry,
         }
     }

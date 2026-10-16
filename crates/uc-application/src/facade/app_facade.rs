@@ -37,8 +37,8 @@ use crate::facade::roster::{
     MemberSummary, PeerReachabilityRefreshReport, PeerSnapshotView, RosterError,
 };
 use crate::facade::{
-    MembershipDiagnosticsView, MembershipReadiness, QueryMembershipDiagnosticsError,
-    QueryMembershipReadinessError,
+    ExportFileSourcePort, FileExportDestination, MembershipDiagnosticsView, MembershipReadiness,
+    QueryMembershipDiagnosticsError, QueryMembershipReadinessError, ResourceFacadeError,
 };
 use crate::space::PeerConnectionError;
 
@@ -336,6 +336,17 @@ impl AppFacade {
         entry_id: &str,
     ) -> Result<crate::facade::FileResourceView, crate::facade::ResourceFacadeError> {
         self.resource.entry_file(entry_id).await
+    }
+
+    pub async fn export_entry_files(
+        &self,
+        entry_id: &str,
+        sources: &dyn ExportFileSourcePort,
+        destination: &mut dyn FileExportDestination,
+    ) -> Result<(), ResourceFacadeError> {
+        self.resource
+            .export_entry_files(entry_id, sources, destination)
+            .await
     }
 
     /// A1:初始化空间。外部业务入口从 `AppFacade` 进入,不直接拿 `SpaceFacade`。

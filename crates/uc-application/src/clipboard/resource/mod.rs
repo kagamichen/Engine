@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+mod file_export;
+pub use file_export::{ExportFileSource, ExportFileSourcePort, FileExportDestination};
+
 use tracing::instrument;
 use uc_core::blob::ports::BlobReaderPort;
 use uc_core::clipboard::{
@@ -280,6 +283,7 @@ fn sanitize_basename(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod file_export;
     use super::*;
 
     use anyhow::Result;

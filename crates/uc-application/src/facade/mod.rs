@@ -132,7 +132,8 @@ pub use host_event::{
 };
 
 pub use crate::clipboard::resource::{
-    BinaryResourceView, FileResourceView, ResourceFacade, ResourceFacadeError,
+    BinaryResourceView, ExportFileSource, ExportFileSourcePort, FileExportDestination,
+    FileResourceView, ResourceFacade, ResourceFacadeError,
 };
 pub use roster::{
     connection_channel_to_wire, ConnectionChannel, ContentTypesPatch, ContentTypesView,

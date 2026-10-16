@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use tokio_util::sync::CancellationToken;
@@ -19,8 +19,8 @@ use uc_observability_contract::{error_source::io_error_kind, uc_error, uc_warn};
 
 use super::{operation_error_with_code, operation_unavailable_error, ProductionRuntime};
 use crate::{
-    EngineError, EngineErrorCategory, ExportEntryInput, HostFileAccess, OperationResult,
-    SendFilesInput, SendImageInput, SendTextInput,
+    EngineError, EngineErrorCategory, ExportEntryInput, HostCapabilityError, HostFileAccess,
+    OperationResult, SendFilesInput, SendImageInput, SendTextInput,
 };
 
 const EXPORT_CHUNK_SIZE: usize = 64 * 1024;
@@ -201,7 +201,7 @@ impl ProductionRuntime {
                     return Err(map_send_host_error(error));
                 }
             };
-            if metadata.size_bytes == 0 || !valid_host_display_name(&metadata.display_name) {
+            if !valid_host_display_name(&metadata.display_name) {
                 cleanup_failed_import(&operation_dir);
                 return Err(send_invalid_input_error());
             }
@@ -465,18 +465,35 @@ fn map_export_history_error(error: ClipboardHistoryError) -> EngineError {
     }
 }
 
-fn map_export_resource_error(error: ResourceFacadeError) -> EngineError {
+pub(super) fn map_export_resource_error(error: ResourceFacadeError) -> EngineError {
     match error {
         ResourceFacadeError::NotFound => {
             EngineError::new(EXPORT_NOT_FOUND_CODE, EngineErrorCategory::NotFound, false)
         }
-        ResourceFacadeError::Mismatch(_) | ResourceFacadeError::Internal(_) => {
+        ResourceFacadeError::Mismatch(_) => {
             operation_error_with_code(EXPORT_FAILED_CODE, "load export resource", error)
+        }
+        ResourceFacadeError::Internal(error) => {
+            if let Some(host_error) = error.chain().find_map(|source| {
+                source.downcast_ref::<HostCapabilityError>().or_else(|| {
+                    source
+                        .downcast_ref::<io::Error>()?
+                        .get_ref()?
+                        .downcast_ref::<HostCapabilityError>()
+                })
+            }) {
+                return map_export_host_error(host_error.clone());
+            }
+            operation_error_with_code(
+                EXPORT_FAILED_CODE,
+                "load export resource",
+                ResourceFacadeError::Internal(error),
+            )
         }
     }
 }
 
-fn map_export_host_error(error: crate::HostCapabilityError) -> EngineError {
+pub(super) fn map_export_host_error(error: HostCapabilityError) -> EngineError {
     let (code, category, retryable) = match error.category() {
         crate::HostCapabilityErrorCategory::InvalidHandle => (
             EXPORT_INVALID_TARGET_CODE,

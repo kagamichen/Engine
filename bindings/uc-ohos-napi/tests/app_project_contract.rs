@@ -115,47 +115,23 @@ fn ohos_probe_page_loads_the_engine_version_from_napi() {
 }
 
 #[test]
-fn ohos_probe_exposes_membership_convergence_from_the_engine() {
+fn ohos_probe_uses_current_device_contract() {
     let declarations = read("bindings/uc-ohos-napi/ohos/index.d.ts");
     let runtime = read("tests/hosts/ohos/entry/src/main/ets/host/EngineRuntime.ets");
     let page = read("tests/hosts/ohos/entry/src/main/ets/pages/Index.ets");
-
-    assert!(declarations.contains("queryMembershipConvergence(): Promise<OhMembershipConvergence>"));
-    assert!(runtime.contains("active.queryMembershipConvergence()"));
-    assert!(runtime.contains("convergenceState"));
-    assert!(page.contains("snapshot.convergenceState"));
-}
-
-#[test]
-fn ohos_probe_exposes_the_complete_member_removal_contract() {
-    let declarations = read("bindings/uc-ohos-napi/ohos/index.d.ts");
-    let runtime = read("tests/hosts/ohos/entry/src/main/ets/host/EngineRuntime.ets");
-    let page = read("tests/hosts/ohos/entry/src/main/ets/pages/Index.ets");
-
-    for method in [
-        "removeMember(deviceId: string): Promise<OhMemberRemoval>",
-        "queryMemberRemoval(): Promise<OhMemberRemoval>",
-        "nextEvent(timeoutMs: number): Promise<OhEngineEvent | null>",
+    assert!(declarations.contains("listDevices(): Promise<OhDevice[]>"));
+    assert!(runtime.contains("active.listDevices()"));
+    assert!(page.contains("snapshot.deviceCount"));
+    for obsolete in [
+        "queryMembershipConvergence",
+        "queryMemberRemoval",
+        "refreshSharedDevices",
     ] {
-        assert!(declarations.contains(method), "missing method: {method}");
+        assert!(!declarations.contains(obsolete));
+        assert!(!runtime.contains(obsolete));
     }
-    for field in [
-        "phase: 'applied' | 'converging' | 'complete' | 'recovery_required'",
-        "intentCount: number",
-        "effectiveMemberCount: number",
-        "convergenceDigest?: string",
-        "updatedAtMs: number",
-        "memberRemoval?: OhMemberRemoval",
-    ] {
-        assert!(declarations.contains(field), "missing field: {field}");
-    }
-    assert!(runtime.contains("active.queryMemberRemoval()"));
-    assert!(runtime.contains("effectiveMemberCount: removal.effectiveMemberCount"));
-    assert!(runtime.contains("updatedAtMs: removal.updatedAtMs"));
-    assert!(page.contains("snapshot.memberRemovalState"));
-    assert!(page.contains("Button('Member removal')"));
-    assert!(page.contains("Member removal query failed"));
-    assert!(page.contains("void this.queryCurrentMemberRemoval();"));
+    assert!(declarations.contains("removeMember(deviceId: string): Promise<string>"));
+    assert!(declarations.contains("deviceTrustRevision?: number"));
 }
 
 #[test]

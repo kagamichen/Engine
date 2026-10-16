@@ -1,8 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::events::{transfer_progress, OhPeerPresence, OhReceiveAttempt, OhTransferStatus};
 use crate::observability::schedule_flush_after_success;
-use napi::bindgen_prelude::Buffer;
+use crate::security::profile_recovery;
+use crate::settings::settings_section;
+use napi::bindgen_prelude::Uint8Array;
 use napi::Status;
 use napi_derive::napi;
 use uc_engine::observability::uc_warn;
@@ -20,12 +23,12 @@ use zeroize::Zeroizing;
 use crate::{
     host, OhActiveClipboard, OhEngineConfig, OhEngineEvent, OhHost, OhInvitationIssued,
     OhJoinSpaceStatus, OhJoinedSpace, OhLocalDevice, OhNetworkRecoveryStatus, OhRelayOverview,
-    OhRelayOverviewEntry, OhSendReport, OhSessionRecovery, OhSpaceCreated, OhWorkspaceConvergence,
+    OhRelayOverviewEntry, OhSendReport, OhSessionRecovery, OhSpaceCreated,
 };
 
 #[napi]
 pub struct OhEngine {
-    engine: Arc<Engine>,
+    pub(crate) engine: Arc<Engine>,
     events: tokio::sync::Mutex<EventStream>,
 }
 
@@ -44,7 +47,7 @@ impl OhStartupLifecycle {
         }
     }
 
-    fn take_input(&self) -> napi::Result<StartupLifecycleInput> {
+    pub(crate) fn take_input(&self) -> napi::Result<StartupLifecycleInput> {
         self.input
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -78,13 +81,13 @@ impl OhEngine {
     pub(crate) async fn start(
         config: OhEngineConfig,
         host: OhHost,
-        lifecycle: &OhStartupLifecycle,
+        lifecycle: StartupLifecycleInput,
     ) -> napi::Result<Self> {
         let capabilities = host::capabilities(host)?;
         let config = EngineConfig::new(config.app_version).with_profile_id(config.profile_id);
         let (progress, _) = StartupProgress::channel();
         let (engine, events) =
-            Engine::start_with_lifecycle(config, capabilities, progress, lifecycle.take_input()?)
+            Engine::start_with_lifecycle(config, capabilities, progress, lifecycle)
                 .await
                 .map_err(engine_error)?;
         Ok(Self {
@@ -295,14 +298,14 @@ impl OhEngine {
     }
 
     #[napi]
-    pub async fn remove_member(&self, device_id: String) -> napi::Result<OhWorkspaceConvergence> {
+    pub async fn remove_member(&self, device_id: String) -> napi::Result<String> {
         let result = self
             .engine
             .execute(Operation::RemoveMember(RemoveMemberInput { device_id }))
             .await
             .map_err(engine_error)?;
         match result {
-            OperationResult::WorkspaceMembership(summary) => workspace_convergence(summary),
+            OperationResult::DeviceTrust(summary) => summary_json(serde_json::to_string(&summary)),
             _ => Err(unexpected_result()),
         }
     }
@@ -411,7 +414,7 @@ impl OhEngine {
     #[napi]
     pub async fn send_image(
         &self,
-        bytes: Buffer,
+        bytes: Uint8Array,
         mime_type: String,
         target_devices: Vec<String>,
     ) -> napi::Result<OhSendReport> {
@@ -539,6 +542,27 @@ impl OhEngine {
     }
 
     #[napi]
+    pub async fn export_entry_files(
+        &self,
+        entry_id: String,
+        destination_handle: String,
+    ) -> napi::Result<()> {
+        let destination_handle = Zeroizing::new(destination_handle);
+        let result = self
+            .engine
+            .execute(Operation::ExportEntryFiles(ExportEntryInput {
+                entry_id,
+                destination: HostFileHandle::new(destination_handle.to_string()),
+            }))
+            .await
+            .map_err(engine_error)?;
+        match result {
+            OperationResult::EntryExported => Ok(()),
+            _ => Err(unexpected_result()),
+        }
+    }
+
+    #[napi]
     pub async fn suspend(&self) -> napi::Result<()> {
         let result = self.engine.suspend().await.map_err(engine_error);
         schedule_flush_after_success(&result);
@@ -598,54 +622,6 @@ impl OhEngine {
         schedule_flush_after_success(&result);
         result
     }
-}
-
-fn workspace_convergence(
-    summary: uc_engine::WorkspaceConvergenceSummary,
-) -> napi::Result<OhWorkspaceConvergence> {
-    Ok(OhWorkspaceConvergence {
-        phase: match summary.phase {
-            uc_engine::WorkspaceConvergencePhaseSummary::LocallyApplied => "locally_applied",
-            uc_engine::WorkspaceConvergencePhaseSummary::Converging => "converging",
-            uc_engine::WorkspaceConvergencePhaseSummary::Complete => "complete",
-            uc_engine::WorkspaceConvergencePhaseSummary::RecoveryRequired => "recovery_required",
-        }
-        .to_owned(),
-        revision: summary.revision as f64,
-        history_event_count: count_u64(summary.history_event_count)?,
-        effective_member_count: count_u64(summary.effective_member_count)?,
-        pending_removal_decision_device_ids: summary.pending_removal_decision_device_ids,
-        pending_removal_decision_event_id: summary.pending_removal_decision_event_id,
-        diverged_peer_device_ids: summary.diverged_peer_device_ids,
-        upgrade_required_peer_device_ids: summary.upgrade_required_peer_device_ids,
-        convergence_digest: summary.convergence_digest,
-        removed: summary.removed,
-        updated_at_ms: summary.updated_at_ms as f64,
-        failure_category: summary.failure_category.map(|category| match category {
-            uc_engine::WorkspaceConvergenceFailureCategorySummary::SpaceMismatch => {
-                "space_mismatch".to_owned()
-            }
-            uc_engine::WorkspaceConvergenceFailureCategorySummary::ContinuityGap => {
-                "continuity_gap".to_owned()
-            }
-            uc_engine::WorkspaceConvergenceFailureCategorySummary::IdentityMismatch => {
-                "identity_mismatch".to_owned()
-            }
-            uc_engine::WorkspaceConvergenceFailureCategorySummary::DigestConflict => {
-                "digest_conflict".to_owned()
-            }
-            uc_engine::WorkspaceConvergenceFailureCategorySummary::Unauthorized => {
-                "unauthorized".to_owned()
-            }
-            uc_engine::WorkspaceConvergenceFailureCategorySummary::VersionIncompatible => {
-                "version_incompatible".to_owned()
-            }
-            uc_engine::WorkspaceConvergenceFailureCategorySummary::NoEffectiveMembers => {
-                "no_effective_members".to_owned()
-            }
-            uc_engine::WorkspaceConvergenceFailureCategorySummary::Storage => "storage".to_owned(),
-        }),
-    })
 }
 
 #[cfg(test)]
@@ -849,7 +825,7 @@ fn join_space_status(result: OperationResult) -> napi::Result<OhJoinSpaceStatus>
     })
 }
 
-fn engine_error(error: EngineError) -> napi::Error {
+pub(crate) fn engine_error(error: EngineError) -> napi::Error {
     napi::Error::new(
         Status::GenericFailure,
         format!(
@@ -868,7 +844,7 @@ fn invitation_availability(availability: InvitationAvailability) -> &'static str
     }
 }
 
-fn send_report(report: SendReportSummary) -> napi::Result<OhSendReport> {
+pub(crate) fn send_report(report: SendReportSummary) -> napi::Result<OhSendReport> {
     Ok(OhSendReport {
         entry_id: report.entry_id,
         at_ms: report.at_ms as f64,
@@ -880,12 +856,7 @@ fn send_report(report: SendReportSummary) -> napi::Result<OhSendReport> {
     })
 }
 
-fn count(value: usize) -> napi::Result<u32> {
-    // discarded-source[int-conversion]: `core::num::TryFromIntError`: the target classification already expresses the range or length mismatch
-    u32::try_from(value).map_err(|_| unexpected_result())
-}
-
-fn count_u64(value: u64) -> napi::Result<u32> {
+pub(crate) fn count(value: usize) -> napi::Result<u32> {
     // discarded-source[int-conversion]: `core::num::TryFromIntError`: the target classification already expresses the range or length mismatch
     u32::try_from(value).map_err(|_| unexpected_result())
 }
@@ -902,11 +873,16 @@ fn map_event(event: EngineEvent) -> OhEngineEvent {
         error_code: None,
         error_category: None,
         retryable: None,
-        workspace_convergence: None,
         device_trust_revision: None,
         network_recovery_phase: None,
         next_retry_in_ms: None,
         re_pairing_scope: None,
+        transfer_progress: None,
+        transfer_status: None,
+        receive_attempt: None,
+        peer_presence: None,
+        settings_sections: None,
+        profile_recovery: None,
     };
     match event {
         EngineEvent::StateChanged { state } => mapped.state = Some(engine_state(state).to_owned()),
@@ -931,6 +907,18 @@ fn map_event(event: EngineEvent) -> OhEngineEvent {
             map_event_error(error, &mut mapped);
         }
         EngineEvent::Fatal { error } => map_event_error(error, &mut mapped),
+        EngineEvent::ProfileRecoveryChanged(summary) => {
+            mapped.profile_recovery = Some(profile_recovery(summary));
+        }
+        EngineEvent::SettingsChanged(change) => {
+            mapped.settings_sections = Some(
+                change
+                    .sections
+                    .into_iter()
+                    .map(|section| settings_section(section).to_owned())
+                    .collect(),
+            );
+        }
         EngineEvent::DeviceTrustChanged { revision } => {
             mapped.device_trust_revision = Some(revision as f64);
         }
@@ -938,6 +926,32 @@ fn map_event(event: EngineEvent) -> OhEngineEvent {
             mapped.network_recovery_phase = Some(recovery_phase(status.phase).to_owned());
             mapped.retryable = Some(status.retryable);
             mapped.next_retry_in_ms = status.next_retry_in_ms.map(|value| value as f64);
+        }
+        EngineEvent::TransferProgress(progress) => {
+            mapped.transfer_progress = Some(transfer_progress(progress));
+        }
+        EngineEvent::TransferStatusChanged(status) => {
+            mapped.transfer_status = Some(OhTransferStatus {
+                transfer_id: status.transfer_id,
+                entry_id: status.entry_id,
+                attempt_id: status.attempt_id,
+                status: status.status,
+                reason: status.reason,
+            });
+        }
+        EngineEvent::ReceiveAttemptStateChanged(attempt) => {
+            mapped.receive_attempt = Some(OhReceiveAttempt {
+                entry_id: attempt.entry_id,
+                attempt_id: attempt.attempt_id,
+                state: attempt.state,
+            });
+        }
+        EngineEvent::PeerPresenceChanged(presence) => {
+            mapped.peer_presence = Some(OhPeerPresence {
+                device_id: presence.device_id,
+                state: presence.state,
+                at_ms: presence.at_ms as f64,
+            });
         }
         EngineEvent::RePairingRequired { scope } => {
             mapped.re_pairing_scope = Some(
@@ -1009,7 +1023,7 @@ fn summary_json(serialized: serde_json::Result<String>) -> napi::Result<String> 
     })
 }
 
-fn unexpected_result() -> napi::Error {
+pub(crate) fn unexpected_result() -> napi::Error {
     napi::Error::new(Status::GenericFailure, "UC_ENGINE:UNEXPECTED_RESULT")
 }
 
@@ -1019,9 +1033,7 @@ fn invalid_restore_mode() -> napi::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        count, device_trust_json, engine_error, join_space_status, map_event, workspace_convergence,
-    };
+    use super::{count, device_trust_json, engine_error, join_space_status, map_event};
     use uc_engine::{
         EngineError, EngineErrorCategory, EngineEvent, OperationResult, OperationTerminal,
         RefreshReason,
@@ -1066,6 +1078,22 @@ mod tests {
 
         assert_eq!(event.kind, "re_pairing_required");
         assert_eq!(event.re_pairing_scope.as_deref(), Some("all_devices"));
+    }
+
+    #[test]
+    fn settings_events_keep_changed_sections_without_setting_values() {
+        let event = map_event(EngineEvent::SettingsChanged(uc_engine::SettingsChanged {
+            sections: vec![
+                uc_engine::SettingsSectionSummary::Sync,
+                uc_engine::SettingsSectionSummary::Security,
+            ],
+        }));
+        assert_eq!(event.kind, "settings_changed");
+        assert_eq!(
+            event.settings_sections,
+            Some(vec!["sync".to_owned(), "security".to_owned()])
+        );
+        assert!(event.state.is_none());
     }
 
     #[test]
@@ -1192,44 +1220,44 @@ mod tests {
     }
 
     #[test]
-    fn oversized_delivery_counts_are_rejected() {
-        assert!(count(usize::MAX).is_err());
+    fn transfer_events_preserve_progress_and_cancellation_identity() {
+        let event = map_event(EngineEvent::TransferProgress(uc_engine::TransferProgress {
+            transfer_id: "transfer".into(),
+            entry_id: Some("entry".into()),
+            attempt_id: Some("attempt".into()),
+            peer_id: "peer".into(),
+            direction: uc_engine::TransferDirectionSummary::Receiving,
+            completed_bytes: u64::MAX - 1,
+            total_bytes: Some(u64::MAX),
+        }));
+        let progress = event.transfer_progress.unwrap();
+        assert_eq!(event.kind, "transfer_progress");
+        assert_eq!(progress.completed_bytes, "18446744073709551614");
+        assert_eq!(
+            progress.total_bytes.as_deref(),
+            Some("18446744073709551615")
+        );
+        assert_eq!(progress.attempt_id.as_deref(), Some("attempt"));
+        assert_eq!(progress.direction, "receiving");
+
+        let event = map_event(EngineEvent::TransferStatusChanged(
+            uc_engine::TransferStatusChanged {
+                transfer_id: "transfer".into(),
+                entry_id: Some("entry".into()),
+                attempt_id: Some("attempt".into()),
+                status: "cancelled".into(),
+                reason: Some("local_user".into()),
+            },
+        ));
+        let status = event.transfer_status.unwrap();
+        assert_eq!(status.status, "cancelled");
+        assert_eq!(status.reason.as_deref(), Some("local_user"));
+        assert_eq!(status.attempt_id.as_deref(), Some("attempt"));
     }
 
     #[test]
-    fn workspace_convergence_maps_phase_and_counts() {
-        let status = workspace_convergence(uc_engine::WorkspaceConvergenceSummary {
-            phase: uc_engine::WorkspaceConvergencePhaseSummary::Converging,
-            revision: 4,
-            history_event_count: 2,
-            effective_member_count: 2,
-            pending_removal_decision_device_ids: vec!["device-c".to_owned()],
-            pending_removal_decision_event_id: Some("event-c".to_owned()),
-            diverged_peer_device_ids: vec!["device-d".to_owned()],
-            upgrade_required_peer_device_ids: vec!["device-e".to_owned()],
-            convergence_digest: None,
-            removed: false,
-            updated_at_ms: 7,
-            failure_category: None,
-        })
-        .expect("workspace convergence must map");
-
-        assert_eq!(status.phase, "converging");
-        assert_eq!(status.revision, 4.0);
-        assert_eq!(status.history_event_count, 2);
-        assert_eq!(
-            status.pending_removal_decision_device_ids,
-            vec!["device-c".to_owned()]
-        );
-        assert_eq!(
-            status.pending_removal_decision_event_id.as_deref(),
-            Some("event-c")
-        );
-        assert_eq!(status.diverged_peer_device_ids, vec!["device-d".to_owned()]);
-        assert_eq!(
-            status.upgrade_required_peer_device_ids,
-            vec!["device-e".to_owned()]
-        );
+    fn oversized_delivery_counts_are_rejected() {
+        assert!(count(usize::MAX).is_err());
     }
 
     #[test]

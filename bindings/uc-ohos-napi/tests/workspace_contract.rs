@@ -86,9 +86,8 @@ fn ohos_binding_links_the_harmony_napi_runtime() {
 fn ohos_binding_accepts_standard_typed_arrays_from_the_host() {
     let host = read("bindings/uc-ohos-napi/src/host.rs");
 
-    assert!(host.contains("call_host::<_, Option<Uint8Array>>"));
+    assert!(host.contains("property::<Option<Uint8Array>>"));
     assert!(host.contains("property::<Uint8Array>"));
-    assert!(host.contains("call_host::<_, Uint8Array>"));
     assert!(!host.contains("property::<Buffer>"));
 }
 

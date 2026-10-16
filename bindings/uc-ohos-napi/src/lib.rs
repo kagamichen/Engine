@@ -3,19 +3,37 @@
 // HarmonyOS 网络启动的 Send 检查包含深层 netlink 类型，超过编译器默认递归深度。
 #![recursion_limit = "256"]
 
+mod content;
+mod events;
+mod history;
 mod host;
 mod local_diagnostics;
 mod observability;
+mod security;
+mod settings;
+mod transfer;
 pub use local_diagnostics::*;
+pub use security::{
+    OhAdmissionRecovery, OhEncryptionState, OhProfileRecovery, OhSetupInvitation, OhSetupState,
+};
+pub use settings::{
+    OhContentTypesPatch, OhSyncSettings, OhSyncSettingsPatch, OhSyncSettingsUpdate,
+};
 mod runtime;
 
-use napi::bindgen_prelude::{Buffer, External};
+use napi::bindgen_prelude::{External, FromNapiValue, TypeName, Uint8Array, ValidateNapiValue};
 use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction};
 use napi::Env;
 use napi_derive::napi;
 use uc_engine::observability::uc_warn;
 
+pub use content::{OhContentTypes, OhDevice, OhHistoryEntry, OhHistoryPage, OhSyncPreferences};
+pub use events::{OhPeerPresence, OhReceiveAttempt, OhTransferProgress, OhTransferStatus};
+pub use history::{
+    OhBinaryResource, OhDeliveryCounts, OhHistoryDetail, OhHistoryResource, OhResendOutcome,
+};
 pub use runtime::OhEngine;
+pub use transfer::OhReceiveProgress;
 
 #[napi(object)]
 pub struct OhEngineConfig {
@@ -91,11 +109,11 @@ pub struct OhHost {
     pub cache_directory: String,
     pub temporary_directory: String,
     pub secure_storage_get: ThreadsafeFunction<String, ErrorStrategy::Fatal>,
-    pub secure_storage_set: ThreadsafeFunction<(String, Buffer), ErrorStrategy::Fatal>,
+    pub secure_storage_set: ThreadsafeFunction<(String, Uint8Array), ErrorStrategy::Fatal>,
     pub secure_storage_delete: ThreadsafeFunction<String, ErrorStrategy::Fatal>,
     pub file_metadata: ThreadsafeFunction<String, ErrorStrategy::Fatal>,
     pub file_read_chunk: ThreadsafeFunction<(String, String, u32), ErrorStrategy::Fatal>,
-    pub file_write_chunk: ThreadsafeFunction<(String, String, Buffer), ErrorStrategy::Fatal>,
+    pub file_write_chunk: ThreadsafeFunction<(String, String, Uint8Array), ErrorStrategy::Fatal>,
     pub file_finish_write: ThreadsafeFunction<String, ErrorStrategy::Fatal>,
     pub clipboard_read: ThreadsafeFunction<(), ErrorStrategy::Fatal>,
     pub clipboard_write: ThreadsafeFunction<OhClipboardSnapshot, ErrorStrategy::Fatal>,
@@ -106,7 +124,7 @@ pub struct OhClipboardRepresentation {
     pub kind: String,
     pub format: String,
     pub mime_type: Option<String>,
-    pub bytes: Option<Buffer>,
+    pub bytes: Option<Uint8Array>,
     pub handle: Option<String>,
     pub display_name: Option<String>,
     pub size_bytes: Option<String>,
@@ -161,22 +179,6 @@ pub struct OhRelayOverview {
 pub struct OhLocalDevice {
     pub device_id: String,
     pub display_name: String,
-}
-
-#[napi(object)]
-pub struct OhWorkspaceConvergence {
-    pub phase: String,
-    pub revision: f64,
-    pub history_event_count: u32,
-    pub effective_member_count: u32,
-    pub pending_removal_decision_device_ids: Vec<String>,
-    pub pending_removal_decision_event_id: Option<String>,
-    pub diverged_peer_device_ids: Vec<String>,
-    pub upgrade_required_peer_device_ids: Vec<String>,
-    pub convergence_digest: Option<String>,
-    pub removed: bool,
-    pub updated_at_ms: f64,
-    pub failure_category: Option<String>,
 }
 
 #[napi(object)]
@@ -243,11 +245,16 @@ pub struct OhEngineEvent {
     pub error_code: Option<u32>,
     pub error_category: Option<String>,
     pub retryable: Option<bool>,
-    pub workspace_convergence: Option<OhWorkspaceConvergence>,
     pub device_trust_revision: Option<f64>,
     pub network_recovery_phase: Option<String>,
     pub next_retry_in_ms: Option<f64>,
     pub re_pairing_scope: Option<String>,
+    pub transfer_progress: Option<OhTransferProgress>,
+    pub transfer_status: Option<OhTransferStatus>,
+    pub receive_attempt: Option<OhReceiveAttempt>,
+    pub peer_presence: Option<OhPeerPresence>,
+    pub settings_sections: Option<Vec<String>>,
+    pub profile_recovery: Option<OhProfileRecovery>,
 }
 
 pub struct PreparedHost {
@@ -321,19 +328,41 @@ pub fn create_startup_lifecycle() -> runtime::OhStartupLifecycle {
     runtime::OhStartupLifecycle::new()
 }
 
+/// JS 参数转换期间取走 Host，异步任务不持有 External 指针。
+pub struct ConsumedHost(OhHost);
+
+impl TypeName for ConsumedHost {
+    fn type_name() -> &'static str {
+        "External"
+    }
+    fn value_type() -> napi::ValueType {
+        napi::ValueType::External
+    }
+}
+
+impl ValidateNapiValue for ConsumedHost {}
+
+impl FromNapiValue for ConsumedHost {
+    unsafe fn from_napi_value(
+        env: napi::sys::napi_env,
+        value: napi::sys::napi_value,
+    ) -> napi::Result<Self> {
+        let mut prepared = unsafe { External::<PreparedHost>::from_napi_value(env, value)? };
+        prepared
+            .host
+            .take()
+            .map(Self)
+            .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "OHOS_HOST_ALREADY_CONSUMED"))
+    }
+}
+
 #[napi]
 pub async fn start_engine(
     config: OhEngineConfig,
-    mut prepared_host: External<PreparedHost>,
+    prepared_host: ConsumedHost,
     lifecycle: &runtime::OhStartupLifecycle,
 ) -> napi::Result<OhEngine> {
-    let host = prepared_host.host.take().ok_or_else(|| {
-        napi::Error::new(
-            napi::Status::InvalidArg,
-            "OHOS_HOST_ALREADY_CONSUMED".to_owned(),
-        )
-    })?;
-    OhEngine::start(config, host, lifecycle).await
+    OhEngine::start(config, prepared_host.0, lifecycle.take_input()?).await
 }
 
 #[cfg(target_env = "ohos")]

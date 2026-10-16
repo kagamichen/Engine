@@ -30,8 +30,8 @@ export interface OhHost {
   fileReadChunk(handle: string, offset: string, maxBytes: number): OhHostResult<Uint8Array>
   fileWriteChunk(handle: string, offset: string, bytes: Uint8Array): OhHostResult<void>
   fileFinishWrite(handle: string): OhHostResult<void>
-  clipboardRead(): OhHostResult<OhClipboardSnapshot>
-  clipboardWrite(snapshot: OhClipboardSnapshot): OhHostResult<void>
+  clipboardRead(): OhHostResult<OhClipboardSnapshot> | Promise<OhHostResult<OhClipboardSnapshot>>
+  clipboardWrite(snapshot: OhClipboardSnapshot): OhHostResult<void> | Promise<OhHostResult<void>>
 }
 
 export interface OhHostResult<T> {
@@ -148,7 +148,7 @@ export interface OhJoinedSpace {
 }
 
 export interface OhJoinSpaceStatus {
-  status: 'active' | 'pending' | 'processing' | 'rejected' | 'terminated'
+  status: 'active' | 'pending' | 'processing' | 'rejected' | 'terminated' | 'needs_attention'
   joinId: string
   joinedSpace?: OhJoinedSpace
   targetSpaceId?: string
@@ -158,58 +158,9 @@ export interface OhJoinSpaceStatus {
   peerUpgradeRequired: boolean
   rejectionReason?: string
   terminationReason?: 'cancelled' | 'expired' | 'superseded'
-}
-
-export interface OhMembershipConvergence {
-  state: 'complete' | 'converging' | 'waiting_for_upgrade' | 'blocked'
-  pendingCount: number
-  waitingForPeerCount: number
-  waitingForUpdateCount: number
-  versionIncompatibleCount: number
-  blockedCount: number
-  rejectedCount: number
-}
-
-export interface OhSharedDeviceRefreshStarted {
-  requestId: string
-}
-
-export interface OhSharedDeviceRefreshDevice {
-  deviceId: string
-  displayName: string
-  state:
-    | 'discovered'
-    | 'connecting'
-    | 'connected'
-    | 'already_present'
-    | 'waiting_for_peer'
-    | 'waiting_for_update'
-    | 'version_incompatible'
-    | 'rejected'
-}
-
-export interface OhSharedDeviceRefresh {
-  requestId: string
-  phase: 'started' | 'discovering' | 'connecting' | 'round_completed'
-  devices: OhSharedDeviceRefreshDevice[]
-  totalCount: number
-  discoveredCount: number
-  connectingCount: number
-  connectedCount: number
-  alreadyPresentCount: number
-  waitingForPeerCount: number
-  waitingForUpdateCount: number
-  versionIncompatibleCount: number
-  rejectedCount: number
-  unavailableSourceCount: number
-}
-
-export interface OhMemberRemoval {
-  phase: 'applied' | 'converging' | 'complete' | 'recovery_required'
-  intentCount: number
-  effectiveMemberCount: number
-  convergenceDigest?: string
-  updatedAtMs: number
+  attentionReason?: string
+  attentionRecovery?: string
+  nextRetryAtMs?: number
 }
 
 export interface OhEngineEvent {
@@ -222,11 +173,16 @@ export interface OhEngineEvent {
   errorCode?: number
   errorCategory?: string
   retryable?: boolean
-  memberRemoval?: OhMemberRemoval
-  sharedDeviceRefresh?: OhSharedDeviceRefresh
+  deviceTrustRevision?: number
   networkRecoveryPhase?: 'idle' | 'recovering' | 'retry_scheduled' | 'failed'
   nextRetryInMs?: number
   rePairingScope?: 'all_devices'
+  transferProgress?: OhTransferProgress
+  transferStatus?: OhTransferStatus
+  receiveAttempt?: OhReceiveAttempt
+  profileRecovery?: OhProfileRecovery
+  settingsSections?: ('general' | 'sync' | 'retention_policy' | 'security' | 'pairing' | 'keyboard_shortcuts' | 'file_sync' | 'network' | 'mobile_sync' | 'quick_panel')[]
+  peerPresence?: OhPeerPresence
 }
 
 export interface OhSpaceCreated {
@@ -240,15 +196,217 @@ export interface OhActiveClipboard {
   activatedBy: string
 }
 
+export interface OhHistoryEntry {
+  entryId: string
+  contentType: string
+  preview?: string
+  createdAtMs: number
+}
+
+export interface OhHistoryPage {
+  entries: OhHistoryEntry[]
+  nextCursor?: string
+}
+
+export interface OhDevice {
+  deviceId: string
+  displayName: string
+  isLocal: boolean
+  online: boolean
+}
+
+export interface OhContentTypes {
+  text: boolean
+  image: boolean
+  link: boolean
+  file: boolean
+  codeSnippet: boolean
+  richText: boolean
+}
+
+export interface OhSyncPreferences {
+  sendEnabled: boolean
+  receiveEnabled: boolean
+  sendContentTypes: OhContentTypes
+  receiveContentTypes: OhContentTypes
+}
+
+export interface OhHistoryDetail {
+  entryId: string
+  content: string
+  sizeBytes: string
+  createdAtMs: number
+  activeTimeMs: number
+  mimeType?: string
+}
+
+export interface OhHistoryResource {
+  blobId?: string
+  mimeType?: string
+  sizeBytes: string
+  url?: string
+  inlineData?: Uint8Array
+}
+
+export interface OhBinaryResource {
+  bytes: Uint8Array
+  mediaType?: string
+}
+
+export interface OhDeliveryCounts {
+  accepted: number
+  duplicate: number
+  offline: number
+  errored: number
+  pending: number
+}
+
+export interface OhResendOutcome {
+  kind: 'completed' | 'synchronization_disabled' | 'entry_not_found' | 'entry_not_resendable' | 'target_not_trusted' | 'no_eligible_targets'
+  report?: OhDeliveryCounts
+  entryId?: string
+  deviceId?: string
+  reason?: 'remote_origin' | 'payload_lost'
+}
+
+export interface OhReceiveProgress {
+  entryId: string
+  attemptId: string
+  state: string
+  totalBytes: string
+  completedBytes: string
+  itemsTotal: number
+  itemsCompleted: number
+}
+
+export interface OhTransferProgress {
+  transferId: string
+  entryId?: string
+  attemptId?: string
+  peerId: string
+  direction: 'sending' | 'receiving'
+  completedBytes: string
+  totalBytes?: string
+}
+
+export interface OhTransferStatus {
+  transferId: string
+  entryId?: string
+  attemptId?: string
+  status: string
+  reason?: string
+}
+
+export interface OhReceiveAttempt {
+  entryId: string
+  attemptId: string
+  state: string
+}
+
+export interface OhPeerPresence {
+  deviceId: string
+  state: string
+  atMs: number
+}
+
+export interface OhSetupInvitation {
+  invitationCode: string
+  fullInvitation: string
+  expiresAtMs: number
+}
+
+export interface OhSetupState {
+  hasCompleted: boolean
+  spaceId?: string
+  currentInvitation?: OhSetupInvitation
+  deviceName?: string
+  rePairingRequired: boolean
+}
+
+export interface OhEncryptionState {
+  initialized: boolean
+  sessionReady: boolean
+}
+
+export interface OhAdmissionRecovery {
+  category: 'credential_missing' | 'authentication_mismatch' | 'current_metadata_invalid' | 'legacy_fallback_invalid' | 'legacy_migration_failed' | 'record_relation_incomplete' | 'derived_summary_invalid' | 'generation_mismatch' | 'other_storage_error'
+  stage: 'credential' | 'repository_metadata' | 'legacy_repository' | 'repository_record' | 'recovery_summary' | 'storage'
+  action: 'restore_credential' | 'choose_backup' | 'rebuild_derived_state' | 'export_diagnostics'
+}
+
+export interface OhProfileRecovery {
+  state: 'not_required' | 'awaiting_passphrase' | 'recovering' | 'recovered' | 'partially_recoverable' | 'failed' | 'admission_recovery_required'
+  canSubmitPassphrase: boolean
+  restartRequired: boolean
+  backgroundReady: boolean
+  cleanupPending: boolean
+  losses: ('local_history' | 'local_control_state' | 'device_identity')[]
+  admission?: OhAdmissionRecovery
+}
+
+export interface OhSyncSettings {
+  syncEnabled: boolean
+  autoSyncEnabled: boolean
+  syncFrequency: 'realtime' | 'interval'
+  contentTypes: OhContentTypes
+  syncOnRestore: boolean
+}
+
+export interface OhContentTypesPatch {
+  text?: boolean
+  image?: boolean
+  link?: boolean
+  file?: boolean
+  codeSnippet?: boolean
+  richText?: boolean
+}
+
+export interface OhSyncSettingsPatch {
+  syncEnabled?: boolean
+  autoSyncEnabled?: boolean
+  syncFrequency?: 'realtime' | 'interval'
+  contentTypes?: OhContentTypesPatch
+  syncOnRestore?: boolean
+}
+
+export interface OhSyncSettingsUpdate {
+  kind: 'updated' | 'rejected'
+  settings?: OhSyncSettings
+  reason?: string
+}
+
 export interface OhEngine {
+  queryProfileRecovery(): Promise<OhProfileRecovery>
+  querySetupState(): Promise<OhSetupState>
+  queryEncryptionState(): Promise<OhEncryptionState>
+  unlockSpace(passphrase: string): Promise<string>
+  lockEncryption(): Promise<void>
+  querySyncSettings(): Promise<OhSyncSettings>
+  updateSyncSettings(patch: OhSyncSettingsPatch): Promise<OhSyncSettingsUpdate>
+  getHistoryEntry(entryId: string): Promise<OhHistoryDetail>
+  deleteHistoryEntry(entryId: string): Promise<void>
+  getHistoryEntryResource(entryId: string): Promise<OhHistoryResource>
+  readBlob(blobId: string): Promise<OhBinaryResource>
+  resendEntry(entryId: string, targetDevices: string[]): Promise<OhResendOutcome>
+  queryEntryReceiveProgress(entryId: string): Promise<OhReceiveProgress | null>
+  listEntryReceiveProgress(): Promise<OhReceiveProgress[]>
+  cancelEntryReceive(entryId: string, attemptId: string): Promise<'cancelled' | 'not_receiving' | 'too_late' | 'already_terminal' | 'superseded'>
+  cancelInboundTransfer(transferId: string): Promise<'cancelled' | 'not_inflight'>
+  queryMemberSyncPreferences(deviceId: string): Promise<OhSyncPreferences>
+  updateMemberSyncPreferences(deviceId: string, preferences: OhSyncPreferences): Promise<OhSyncPreferences>
+  queryHistory(cursor: string | null, limit: number, query: string | null): Promise<OhHistoryPage>
+  listDevices(): Promise<OhDevice[]>
+  observeClipboardChange(dispatch: boolean): Promise<OhSendReport | null>
+
   createSpace(deviceName: string | null, passphrase: string): Promise<OhSpaceCreated>
   recoverSession(allowSecureStorageUnlock: boolean): Promise<OhSessionRecovery>
+  notifyConnectivityOpportunity(reason: 'foreground' | 'system_wake' | 'network_changed'): Promise<void>
   recoverNetwork(): Promise<void>
   queryNetworkRecoveryStatus(): Promise<OhNetworkRecoveryStatus>
   queryRelayOverview(): Promise<OhRelayOverview>
   queryLocalDevice(): Promise<OhLocalDevice>
   queryDeviceGroupChoices(): Promise<string>
-  queryMembershipConvergence(): Promise<OhMembershipConvergence>
+  chooseDeviceGroup(issueId: string, choiceId: string, expectedRevision: number, confirmLocalRemoval: boolean): Promise<string>
   issueInvitation(): Promise<OhInvitationIssued>
   changeEncryptionPassphrase(passphrase: string, passphraseConfirmation: string): Promise<void>
   joinSpace(
@@ -258,17 +416,19 @@ export interface OhEngine {
     preserveUnreadableHistory: boolean
   ): Promise<OhJoinSpaceStatus>
   cancelJoinSpace(joinId: string): Promise<OhJoinSpaceStatus>
-  refreshSharedDevices(): Promise<OhSharedDeviceRefreshStarted>
-  querySharedDeviceRefresh(requestId: string): Promise<OhSharedDeviceRefresh | null>
-  removeMember(deviceId: string): Promise<OhMemberRemoval>
-  queryMemberRemoval(): Promise<OhMemberRemoval>
+  removeMember(deviceId: string): Promise<string>
   queryActiveClipboard(): Promise<OhActiveClipboard | null>
   lifecycleState(): Promise<string>
   suspend(): Promise<void>
   suspendWithDeadline(deadlineMs: number): Promise<void>
   resume(): Promise<void>
   sendText(text: string, targetDevices: string[]): Promise<OhSendReport>
+  sendImage(bytes: Uint8Array, mimeType: string, targetDevices: string[]): Promise<OhSendReport>
+  sendFiles(fileHandles: string[], targetDevices: string[]): Promise<OhSendReport>
+  captureCurrentClipboard(): Promise<string | null>
+  restoreClipboard(entryId: string, mode: 'standard' | 'plain_text' | 'file_paths'): Promise<'restored' | 'payload_unavailable' | 'not_applicable'>
   exportEntry(entryId: string, destinationHandle: string): Promise<void>
+  exportEntryFiles(entryId: string, destinationHandle: string): Promise<void>
   nextEvent(timeoutMs: number): Promise<OhEngineEvent | null>
   shutdown(deadlineMs: number): Promise<void>
   shutdownUntilComplete(): Promise<void>

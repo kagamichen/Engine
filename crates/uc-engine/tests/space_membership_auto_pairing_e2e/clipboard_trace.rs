@@ -172,13 +172,17 @@ async fn clipboard_trace_case(
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        wait_for_peer_refresh(&source, "all source targets ready before partition").await;
+        wait_for_peer_refresh(&target, "all receiver targets ready before partition").await;
         offline
             .shutdown(SHUTDOWN_TIMEOUT)
             .await
             .expect("stop one target");
     }
-    wait_for_peer_refresh(&source, "source ready").await;
-    wait_for_peer_refresh(&target, "target ready").await;
+    if !partial_target {
+        wait_for_peer_refresh(&source, "source ready").await;
+        wait_for_peer_refresh(&target, "target ready").await;
+    }
     let text = "private clipboard trace acceptance";
     *source_clipboard.lock().expect("source clipboard") = HostClipboardSnapshot {
         observed_at_ms: (unix_time_ns(SystemTime::now()) / 1_000_000) as i64,
@@ -569,7 +573,11 @@ async fn clipboard_trace_case(
                 otlp_string_attribute(&span.attributes, "error.type")
             );
         }
-        for request in &requests {
+        // 捕获服务也可能收到根路径探测；只回放本验收解码并检查过的 OTLP 信号。
+        for request in requests.iter().filter(|request| {
+            request.method.as_str() == "POST"
+                && matches!(request.url.path(), "/v1/traces" | "/v1/logs")
+        }) {
             use std::io::Write;
             use std::process::{Command, Stdio};
             let mut child = Command::new("curl")

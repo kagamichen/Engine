@@ -1,0 +1,781 @@
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use diesel::prelude::*;
+use tempfile::tempdir;
+use uc_core::file_transfer::FileTransferCancellationReason;
+use uc_core::ids::ProfileId;
+use uc_core::ports::security::current_profile::{CurrentProfileError, CurrentProfilePort};
+use uc_core::ports::space::{DeriveSpaceSubkeyPort, SpaceAccessError};
+use uc_core::ports::{
+    AttemptError, AttemptState, BeginReceiveAttemptPort, BeginReceiveFailureOutcome,
+    BeginReceiveFailurePort, BeginReceiveOutcome, CancelDirectoryAttemptTransfersPort,
+    ClaimReceiveCommitPort, FinalizeProvisionalReceivePort, GetEntryAttemptPort,
+    GetEntryReceiveProgressPort, ListNonTerminalAttemptsPort, ListProvisionalReceivesPort,
+    PendingInboundTransfer, ProvisionalInboundTransfer, ProvisionalReceiveAction,
+    ReceiveItemFailureReason, ReceiveItemKind, ReceiveItemRole, RecordReceiverTransferPort,
+    RequestReceiveCancellationOutcome, RequestReceiveCancellationPort, SeedProvisionalReceivePort,
+    TrackedFileTransferStatus, UpdateProvisionalReceivePathPort,
+};
+use uc_infra_storage::db::executor::DieselSqliteExecutor;
+use uc_infra_storage::db::pool::init_db_pool;
+use uc_infra_storage::db::ports::DbExecutor;
+use uc_infra_storage::db::repositories::{
+    DieselEntryReceiveAttemptRepository, DieselFileTransferRepository,
+};
+use uc_infra_storage::db::schema::{directory_publish_log, entry_receive_attempt, file_transfer};
+
+type AttemptRepo = DieselEntryReceiveAttemptRepository<DieselSqliteExecutor>;
+type TransferRepo = DieselFileTransferRepository<DieselSqliteExecutor>;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_receive_waits_for_an_independent_database_writer() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("concurrent-attempt.sqlite");
+    let pool = init_db_pool(database.to_str().unwrap()).unwrap();
+    let writer_pool = pool.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let mut connection = writer_pool.get().unwrap();
+        connection
+            .immediate_transaction::<_, diesel::result::Error, _>(|_| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    locked_rx.recv().unwrap();
+    let attempts = Arc::new(AttemptRepo::new(DieselSqliteExecutor::new(pool)));
+    let mut begin =
+        tokio::spawn(async move { attempts.begin_first_receive("entry", "attempt", 1).await });
+    assert!(tokio::time::timeout(Duration::from_millis(100), &mut begin)
+        .await
+        .is_err());
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(begin.await.unwrap().unwrap(), BeginReceiveOutcome::Begun);
+}
+
+struct FixedSubkey;
+
+#[async_trait]
+impl DeriveSpaceSubkeyPort for FixedSubkey {
+    async fn derive_subkey(&self, _salt: &[u8], info: &[u8]) -> Result<[u8; 32], SpaceAccessError> {
+        Ok(if info.ends_with(b"metadata/v1") {
+            [0x5A; 32]
+        } else {
+            [0xA5; 32]
+        })
+    }
+}
+
+struct FixedProfile;
+
+#[async_trait]
+impl CurrentProfilePort for FixedProfile {
+    async fn current_profile(&self) -> Result<ProfileId, CurrentProfileError> {
+        Ok(ProfileId::from("test"))
+    }
+}
+
+fn repos() -> (
+    AttemptRepo,
+    TransferRepo,
+    DieselSqliteExecutor,
+    tempfile::TempDir,
+) {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("attempt.sqlite");
+    let pool = init_db_pool(database.to_str().unwrap()).unwrap();
+    let derive_subkey: Arc<dyn DeriveSpaceSubkeyPort> = Arc::new(FixedSubkey);
+    let current_profile: Arc<dyn CurrentProfilePort> = Arc::new(FixedProfile);
+    (
+        AttemptRepo::new(DieselSqliteExecutor::new(pool.clone())),
+        TransferRepo::new(
+            DieselSqliteExecutor::new(pool.clone()),
+            derive_subkey,
+            current_profile,
+        ),
+        DieselSqliteExecutor::new(pool),
+        directory,
+    )
+}
+
+async fn seed_transfer(
+    repo: &TransferRepo,
+    transfer_id: &str,
+    entry_id: &str,
+    attempt_id: Option<&str>,
+    file_size: Option<i64>,
+) {
+    repo.upsert_pending_transfer(&PendingInboundTransfer {
+        item_role: None,
+        transfer_id: transfer_id.to_owned(),
+        entry_id: entry_id.to_owned(),
+        attempt_id: attempt_id.map(str::to_owned),
+        origin_device_id: "peer-a".to_owned(),
+        filename: "member.bin".to_owned(),
+        file_size,
+        cached_path: String::new(),
+        created_at_ms: 1,
+    })
+    .await
+    .unwrap();
+}
+
+fn set_completed(writer: &DieselSqliteExecutor, transfer_id: &str) {
+    let transfer_id = transfer_id.to_owned();
+    writer
+        .run(move |conn| {
+            diesel::update(file_transfer::table.filter(file_transfer::transfer_id.eq(transfer_id)))
+                .set(file_transfer::status.eq(TrackedFileTransferStatus::Completed.as_str()))
+                .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn provisional_mobile_transfer_is_adopted_only_by_the_exact_receiving_attempt() {
+    let (attempts, transfers, writer, _directory) = repos();
+    transfers
+        .seed_provisional_receive(&ProvisionalInboundTransfer {
+            transfer_id: "mobile-1".to_owned(),
+            origin_device_id: "mobile:phone".to_owned(),
+            filename: "photo.jpg".to_owned(),
+            file_size: Some(42),
+            created_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    attempts
+        .begin_first_receive("entry-1", "attempt-1", 2)
+        .await
+        .unwrap();
+
+    let stale = transfers
+        .finalize_provisional_receive(
+            "mobile-1",
+            ProvisionalReceiveAction::AdoptIntoAttempt {
+                entry_id: "entry-1".to_owned(),
+                attempt_id: "stale".to_owned(),
+                item_id: "mobile-item-1".to_owned(),
+                role: ReceiveItemRole::Representation,
+            },
+            3,
+        )
+        .await;
+    assert!(stale.is_err());
+
+    transfers
+        .finalize_provisional_receive(
+            "mobile-1",
+            ProvisionalReceiveAction::AdoptIntoAttempt {
+                entry_id: "entry-1".to_owned(),
+                attempt_id: "attempt-1".to_owned(),
+                item_id: "mobile-item-1".to_owned(),
+                role: ReceiveItemRole::Representation,
+            },
+            4,
+        )
+        .await
+        .unwrap();
+
+    let row = writer
+        .run(|conn| {
+            file_transfer::table
+                .filter(file_transfer::transfer_id.eq("mobile-1"))
+                .select((
+                    file_transfer::entry_id,
+                    file_transfer::attempt_id,
+                    file_transfer::binding_state,
+                    file_transfer::receive_item_id,
+                    file_transfer::item_role,
+                ))
+                .first::<(
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                )>(conn)
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            Some("entry-1".to_owned()),
+            Some("attempt-1".to_owned()),
+            "attempt_bound".to_owned(),
+            Some("mobile-item-1".to_owned()),
+            Some("representation".to_owned()),
+        )
+    );
+}
+
+#[tokio::test]
+async fn fully_held_mobile_transfer_is_discarded_without_an_attempt() {
+    let (_attempts, transfers, writer, _directory) = repos();
+    transfers
+        .seed_provisional_receive(&ProvisionalInboundTransfer {
+            transfer_id: "mobile-duplicate".to_owned(),
+            origin_device_id: "mobile:phone".to_owned(),
+            filename: "duplicate.bin".to_owned(),
+            file_size: Some(7),
+            created_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    transfers
+        .finalize_provisional_receive(
+            "mobile-duplicate",
+            ProvisionalReceiveAction::DiscardAsFullyHeld,
+            2,
+        )
+        .await
+        .unwrap();
+
+    let remaining = writer
+        .run(|conn| {
+            file_transfer::table
+                .filter(file_transfer::transfer_id.eq("mobile-duplicate"))
+                .count()
+                .get_result::<i64>(conn)
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn provisional_mobile_recovery_path_round_trips_only_through_encrypted_metadata() {
+    let (_attempts, transfers, writer, _directory) = repos();
+    transfers
+        .seed_provisional_receive(&ProvisionalInboundTransfer {
+            transfer_id: "mobile-orphan".to_owned(),
+            origin_device_id: "mobile:phone".to_owned(),
+            filename: "orphan.bin".to_owned(),
+            file_size: Some(7),
+            created_at_ms: 1,
+        })
+        .await
+        .unwrap();
+    let uri = "file:///tmp/mobile-provisional-private-sentinel.bin";
+    transfers
+        .update_provisional_receive_path("mobile-orphan", uri, 2)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        transfers.list_provisional_receives().await.unwrap(),
+        vec![uc_core::ports::ProvisionalReceiveRecovery {
+            transfer_id: "mobile-orphan".to_owned(),
+            cached_path: Some(uri.to_owned()),
+        }]
+    );
+    let ciphertext = writer
+        .run(|conn| {
+            file_transfer::table
+                .filter(file_transfer::transfer_id.eq("mobile-orphan"))
+                .select(file_transfer::metadata_ciphertext)
+                .first::<Vec<u8>>(conn)
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+    assert!(!ciphertext
+        .windows(uri.len())
+        .any(|window| window == uri.as_bytes()));
+}
+
+#[tokio::test]
+async fn generic_receive_state_machine_resolves_competing_settlements() {
+    let (repo, _transfers, writer, _directory) = repos();
+    assert_eq!(
+        repo.begin_first_receive("entry", "a1", 1).await.unwrap(),
+        BeginReceiveOutcome::Begun
+    );
+    assert_eq!(
+        repo.begin_first_receive("entry", "other", 2).await.unwrap(),
+        BeginReceiveOutcome::AlreadyReceiving
+    );
+    assert_eq!(
+        repo.request_receive_cancellation("entry", "stale", 3)
+            .await
+            .unwrap(),
+        RequestReceiveCancellationOutcome::Superseded
+    );
+    assert_eq!(
+        repo.request_receive_cancellation("entry", "a1", 4)
+            .await
+            .unwrap(),
+        RequestReceiveCancellationOutcome::Requested
+    );
+    assert_eq!(
+        repo.begin_receive_failure("entry", "a1", 5).await.unwrap(),
+        BeginReceiveFailureOutcome::CancellationWon
+    );
+    assert_eq!(
+        repo.request_receive_cancellation("entry", "a1", 6)
+            .await
+            .unwrap(),
+        RequestReceiveCancellationOutcome::AlreadyCancelling
+    );
+
+    writer
+        .run(|conn| {
+            diesel::update(
+                entry_receive_attempt::table.filter(entry_receive_attempt::entry_id.eq("entry")),
+            )
+            .set(entry_receive_attempt::attempt_state.eq(AttemptState::Cancelled.to_string()))
+            .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        repo.begin_redelivery("entry", "a1", "a2", 7).await.unwrap(),
+        BeginReceiveOutcome::Begun
+    );
+    assert!(repo.claim_receive_commit("entry", "a2", 8).await.unwrap());
+    assert_eq!(
+        repo.request_receive_cancellation("entry", "a2", 9)
+            .await
+            .unwrap(),
+        RequestReceiveCancellationOutcome::TooLate
+    );
+    assert_eq!(
+        repo.begin_receive_failure("entry", "a2", 10).await.unwrap(),
+        BeginReceiveFailureOutcome::Begun
+    );
+
+    let current = repo.get_entry_attempt("entry").await.unwrap().unwrap();
+    assert_eq!(current.current_attempt_id, "a2");
+    assert_eq!(current.state, AttemptState::Failing);
+    assert_eq!(
+        repo.list_non_terminal_attempts().await.unwrap(),
+        vec![current]
+    );
+}
+
+#[tokio::test]
+async fn concurrent_cancel_and_commit_claim_have_exactly_one_winner() {
+    let (repo, _transfers, _writer, _directory) = repos();
+    let repo = Arc::new(repo);
+    repo.begin_first_receive("entry", "a1", 1).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let commit = {
+        let repo = Arc::clone(&repo);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            repo.claim_receive_commit("entry", "a1", 2).await.unwrap()
+        })
+    };
+    let cancel = {
+        let repo = Arc::clone(&repo);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(async move {
+            barrier.wait().await;
+            repo.request_receive_cancellation("entry", "a1", 2)
+                .await
+                .unwrap()
+        })
+    };
+    barrier.wait().await;
+
+    let commit_won = commit.await.unwrap();
+    let cancel_outcome = cancel.await.unwrap();
+    assert_ne!(
+        commit_won,
+        cancel_outcome == RequestReceiveCancellationOutcome::Requested
+    );
+    let current = repo.get_entry_attempt("entry").await.unwrap().unwrap();
+    if commit_won {
+        assert_eq!(cancel_outcome, RequestReceiveCancellationOutcome::TooLate);
+        assert_eq!(current.state, AttemptState::Committing);
+    } else {
+        assert_eq!(cancel_outcome, RequestReceiveCancellationOutcome::Requested);
+        assert_eq!(current.state, AttemptState::Cancelling);
+    }
+}
+
+#[tokio::test]
+async fn redelivery_replaces_only_failed_or_cancelled_attempts() {
+    let (repo, _transfers, writer, _directory) = repos();
+    repo.begin_first_receive("entry", "a1", 1).await.unwrap();
+    assert_eq!(
+        repo.begin_redelivery("entry", "a1", "a2", 2).await.unwrap(),
+        BeginReceiveOutcome::AlreadyReceiving
+    );
+
+    writer
+        .run(|conn| {
+            diesel::update(
+                entry_receive_attempt::table.filter(entry_receive_attempt::entry_id.eq("entry")),
+            )
+            .set(entry_receive_attempt::attempt_state.eq(AttemptState::Completed.to_string()))
+            .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        repo.begin_redelivery("entry", "a1", "a2", 3).await.unwrap(),
+        BeginReceiveOutcome::Superseded
+    );
+
+    writer
+        .run(|conn| {
+            diesel::update(
+                entry_receive_attempt::table.filter(entry_receive_attempt::entry_id.eq("entry")),
+            )
+            .set(entry_receive_attempt::attempt_state.eq(AttemptState::Failed.to_string()))
+            .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        repo.begin_redelivery("entry", "a1", "a2", 4).await.unwrap(),
+        BeginReceiveOutcome::Begun
+    );
+    let current = repo.get_entry_attempt("entry").await.unwrap().unwrap();
+    assert_eq!(current.current_attempt_id, "a2");
+    assert_eq!(current.state, AttemptState::Receiving);
+}
+
+#[tokio::test]
+async fn corrupted_attempt_state_is_rejected() {
+    let (repo, _transfers, writer, _directory) = repos();
+    repo.begin_first_receive("entry", "a1", 1).await.unwrap();
+    writer
+        .run(|conn| {
+            diesel::update(
+                entry_receive_attempt::table.filter(entry_receive_attempt::entry_id.eq("entry")),
+            )
+            .set(entry_receive_attempt::attempt_state.eq("unknown"))
+            .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(matches!(
+        repo.get_entry_attempt("entry").await,
+        Err(AttemptError::InvalidState(state)) if state == "unknown"
+    ));
+    assert!(matches!(
+        repo.request_receive_cancellation("entry", "a1", 2).await,
+        Err(AttemptError::InvalidState(state)) if state == "unknown"
+    ));
+}
+
+#[tokio::test]
+async fn receive_progress_uses_only_the_current_attempt() {
+    let (attempts, transfers, writer, _directory) = repos();
+    attempts
+        .begin_first_receive("entry", "a1", 1)
+        .await
+        .unwrap();
+    seed_transfer(&transfers, "old-member", "entry", Some("a1"), Some(7)).await;
+    set_completed(&writer, "old-member");
+
+    writer
+        .run(|conn| {
+            diesel::update(
+                entry_receive_attempt::table.filter(entry_receive_attempt::entry_id.eq("entry")),
+            )
+            .set(entry_receive_attempt::attempt_state.eq(AttemptState::Failed.to_string()))
+            .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        attempts
+            .begin_redelivery("entry", "a1", "a2", 2)
+            .await
+            .unwrap(),
+        BeginReceiveOutcome::Begun
+    );
+    seed_transfer(&transfers, "new-pending", "entry", Some("a2"), Some(20)).await;
+    seed_transfer(&transfers, "new-complete", "entry", Some("a2"), Some(30)).await;
+    set_completed(&writer, "new-complete");
+
+    let progress = transfers
+        .get_entry_receive_progress("entry")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.attempt_id, "a2");
+    assert_eq!(progress.state, AttemptState::Receiving);
+    assert_eq!(progress.total_bytes, 50);
+    assert_eq!(progress.completed_bytes, 0);
+    assert_eq!(progress.items_total, 2);
+    assert_eq!(progress.items_completed, 0);
+    assert!(progress
+        .items
+        .iter()
+        .all(|item| item.status != TrackedFileTransferStatus::Completed));
+}
+
+#[tokio::test]
+async fn bulk_cancel_only_updates_non_terminal_members_of_the_exact_attempt() {
+    let (_attempts, transfers, writer, _directory) = repos();
+    seed_transfer(&transfers, "current-pending", "entry", Some("a2"), Some(10)).await;
+    seed_transfer(
+        &transfers,
+        "current-complete",
+        "entry",
+        Some("a2"),
+        Some(20),
+    )
+    .await;
+    seed_transfer(&transfers, "old-pending", "entry", Some("a1"), Some(30)).await;
+    seed_transfer(&transfers, "legacy", "entry", None, Some(40)).await;
+    set_completed(&writer, "current-complete");
+
+    let changed = transfers
+        .cancel_attempt_transfers("entry", "a2", FileTransferCancellationReason::LocalUser, 9)
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let rows = writer
+        .run(|conn| {
+            Ok(file_transfer::table
+                .select((
+                    file_transfer::transfer_id,
+                    file_transfer::status,
+                    file_transfer::failure_code,
+                ))
+                .order(file_transfer::transfer_id.asc())
+                .load::<(String, String, Option<String>)>(conn)?)
+        })
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("current-complete".into(), "completed".into(), None),
+            (
+                "current-pending".into(),
+                "cancelled".into(),
+                Some("local_user".into())
+            ),
+            ("legacy".into(), "pending".into(), None),
+            ("old-pending".into(), "pending".into(), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn legacy_transfer_seed_remains_outside_directory_attempt_projection() {
+    let (_attempts, transfers, writer, _directory) = repos();
+    seed_transfer(&transfers, "legacy", "legacy-entry", None, None).await;
+
+    let stored = writer
+        .run(|conn| {
+            Ok(file_transfer::table
+                .filter(file_transfer::transfer_id.eq("legacy"))
+                .select((file_transfer::attempt_id, file_transfer::file_size))
+                .first::<(Option<String>, Option<i64>)>(conn)?)
+        })
+        .unwrap();
+    assert_eq!(stored, (None, None));
+    assert!(transfers
+        .get_entry_receive_progress("legacy-entry")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn receive_items_keep_ids_roles_and_fixed_reasons_without_private_metadata() {
+    let (attempts, transfers, writer, _directory) = repos();
+    attempts
+        .begin_first_receive("entry", "a1", 1)
+        .await
+        .unwrap();
+    for (id, role) in [
+        ("first", Some(ReceiveItemRole::File)),
+        ("image", Some(ReceiveItemRole::Representation)),
+        ("legacy", None),
+    ] {
+        let transfer = PendingInboundTransfer {
+            item_role: role,
+            transfer_id: id.into(),
+            entry_id: "entry".into(),
+            attempt_id: Some("a1".into()),
+            origin_device_id: "private-device-sentinel".into(),
+            filename: "private-name-sentinel.bin".into(),
+            file_size: Some(10),
+            cached_path: "/private/path-sentinel.bin".into(),
+            created_at_ms: 1,
+        };
+        transfers.upsert_pending_transfer(&transfer).await.unwrap();
+        // 重复的历史 seed 缺少类型时，不能擦除已经取得的类型资料。
+        if id == "image" {
+            transfers
+                .upsert_pending_transfer(&PendingInboundTransfer {
+                    item_role: None,
+                    ..transfer
+                })
+                .await
+                .unwrap();
+        }
+    }
+    writer
+        .run(|conn| {
+            diesel::update(file_transfer::table.filter(file_transfer::transfer_id.eq("first")))
+                .set((
+                    file_transfer::status.eq("failed"),
+                    file_transfer::failure_code.eq(Some("access_denied")),
+                ))
+                .execute(conn)?;
+            // 模拟损坏字段；公开查询不能把任意持久字符串当作原因原样返回。
+            diesel::update(file_transfer::table.filter(file_transfer::transfer_id.eq("legacy")))
+                .set((
+                    file_transfer::status.eq("failed"),
+                    file_transfer::failure_code.eq(Some("private-unknown-sentinel")),
+                ))
+                .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+    let progress = transfers
+        .get_entry_receive_progress("entry")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.items.len(), 3);
+    assert_eq!(progress.items[0].item_id, "first");
+    assert_eq!(progress.items[0].kind, ReceiveItemKind::File);
+    assert_eq!(
+        progress.items[0].failure_reason,
+        Some(ReceiveItemFailureReason::AccessDenied)
+    );
+    assert_eq!(progress.items[1].item_id, "image");
+    assert_eq!(progress.items[1].kind, ReceiveItemKind::Representation);
+    assert_eq!(progress.items[2].kind, ReceiveItemKind::Unknown);
+    assert_eq!(
+        progress.items[2].failure_reason,
+        Some(ReceiveItemFailureReason::Unknown)
+    );
+    let exposed = format!("{progress:?}");
+    for private in [
+        "private-device-sentinel",
+        "private-name-sentinel",
+        "path-sentinel",
+        "private-unknown-sentinel",
+    ] {
+        assert!(!exposed.contains(private));
+    }
+}
+
+#[tokio::test]
+async fn directory_receive_query_exposes_one_unit_until_atomic_settlement_finishes() {
+    let (attempts, transfers, writer, _directory) = repos();
+    attempts
+        .begin_first_receive("entry", "a1", 1)
+        .await
+        .unwrap();
+    seed_transfer(&transfers, "first", "entry", Some("a1"), Some(10)).await;
+    seed_transfer(&transfers, "last", "entry", Some("a1"), Some(20)).await;
+    set_completed(&writer, "first");
+    set_completed(&writer, "last");
+    writer
+        .run(|conn| {
+            diesel::insert_into(directory_publish_log::table)
+                .values((
+                    directory_publish_log::entry_id.eq("entry"),
+                    directory_publish_log::attempt_id.eq("a1"),
+                    directory_publish_log::phase.eq("staging"),
+                    directory_publish_log::partial_publication.eq(false),
+                    directory_publish_log::partial_root_count.eq(0),
+                    directory_publish_log::landed.eq(false),
+                    directory_publish_log::updated_at_ms.eq(1),
+                ))
+                .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+    for state in [
+        "receiving",
+        "committing",
+        "cancelling",
+        "failing",
+        "failed",
+        "cancelled",
+        "completed",
+    ] {
+        let stored = state.to_owned();
+        writer
+            .run(move |conn| {
+                diesel::update(
+                    entry_receive_attempt::table
+                        .filter(entry_receive_attempt::entry_id.eq("entry")),
+                )
+                .set(entry_receive_attempt::attempt_state.eq(stored))
+                .execute(conn)?;
+                Ok(())
+            })
+            .unwrap();
+        let progress = transfers
+            .get_entry_receive_progress("entry")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.items.len(), 1);
+        assert_eq!(progress.items[0].item_id, "directory_unit");
+        assert_eq!(progress.items[0].kind, ReceiveItemKind::DirectoryUnit);
+        let expected = match state {
+            "failed" => TrackedFileTransferStatus::Failed,
+            "cancelled" => TrackedFileTransferStatus::Cancelled,
+            "completed" => TrackedFileTransferStatus::Completed,
+            _ => TrackedFileTransferStatus::Transferring,
+        };
+        assert_eq!(progress.items[0].status, expected);
+        // 聚合计数仍表示成员；下载完成不能替代整个目录的业务提交。
+        assert_eq!(progress.items_total, 2);
+        assert_eq!(
+            progress.items_completed,
+            if state == "completed" { 2 } else { 0 }
+        );
+        assert_eq!(
+            progress.completed_bytes,
+            if state == "completed" { 30 } else { 0 }
+        );
+    }
+    // 进程内收尾尚未结束时，持久成员失败也须保留具体原因，不能使父目录提前结束。
+    writer
+        .run(|conn| {
+            diesel::update(
+                entry_receive_attempt::table.filter(entry_receive_attempt::entry_id.eq("entry")),
+            )
+            .set(entry_receive_attempt::attempt_state.eq("receiving"))
+            .execute(conn)?;
+            diesel::update(file_transfer::table.filter(file_transfer::transfer_id.eq("first")))
+                .set((
+                    file_transfer::status.eq("failed"),
+                    file_transfer::failure_code.eq(Some("storage_unavailable")),
+                ))
+                .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+    let pending = transfers
+        .get_entry_receive_progress("entry")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pending.items[0].status,
+        TrackedFileTransferStatus::Transferring
+    );
+    assert_eq!(
+        pending.items[0].failure_reason,
+        Some(ReceiveItemFailureReason::StorageUnavailable)
+    );
+    assert_eq!(pending.items_completed, 0);
+}

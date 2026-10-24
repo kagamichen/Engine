@@ -1,14 +1,20 @@
 //! 连接与恢复诊断的入口：完整动作负责结果，本模块负责关联和记录生命周期。
 use super::ObservationContext;
+use std::future::Future;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 mod address;
 mod address_record;
+mod admission_attempt;
 mod admission_exchange;
 mod admission_network;
+mod admission_response;
+mod invitation_resolution;
 mod local_identity;
 mod local_work;
 mod maintenance;
+pub use admission_attempt::AdmissionAttemptRef;
 pub use admission_exchange::{
     AdmissionExchangeFailure, AdmissionExchangeFailureDetail, AdmissionExchangeObservation,
     AdmissionExchangeSide, AdmissionExchangeStep,
@@ -16,10 +22,15 @@ pub use admission_exchange::{
 pub use admission_network::{
     record_admission_network_snapshot, AdmissionNetworkPoint, AdmissionNetworkSnapshot,
 };
+pub use admission_response::{
+    complete_admission_response_failure, AdmissionResponseFailure, ApplicationCloseClass,
+};
+pub use invitation_resolution::{InvitationResolution, InvitationSource, InvitationSourceOutcome};
 pub use local_identity::{record_local_identity_changed, LocalIdentityState};
 pub use local_work::{
-    observe_blob_publish_sync_result, observe_local_result, observe_local_sync_result,
-    scope_blob_publish, scope_pairing_work, LocalWorkObservation, LocalWorkOutcome, LocalWorkStep,
+    observe_blob_publish_sync_result, observe_invitation_resolution, observe_local_result,
+    observe_local_sync_result, scope_blob_publish, scope_pairing_work, LocalWorkContext,
+    LocalWorkObservation, LocalWorkOutcome, LocalWorkStep,
 };
 pub use maintenance::{
     record_pending_group_updates, MaintenanceDisposition, MaintenanceObservation,
@@ -32,7 +43,8 @@ mod authentication;
 mod clipboard_receive;
 pub use authentication::complete_clipboard_receive_failure;
 pub use clipboard_receive::{
-    describe_clipboard_receive_failure, ClipboardReceiveFailure, ClipboardReceiveObservation,
+    describe_clipboard_receive_failure, describe_clipboard_receive_partial,
+    ClipboardReceiveFailure, ClipboardReceiveObservation, ClipboardRetryOutcome,
 };
 mod connection;
 mod group_update;
@@ -47,7 +59,8 @@ pub use source::{LocalDiagnosticSource, SourceCapability, SourceCollection};
 pub use authentication::complete_group_update_failure;
 pub use authentication::complete_membership_history_failure;
 pub use group_update::{
-    GroupUpdateFailureDetail, GroupUpdatePhase, GroupUpdateReason, GroupUpdateSource,
+    ClassifiedGroupUpdateStorageFailure, GroupUpdateFailureDetail, GroupUpdatePhase,
+    GroupUpdateReason, GroupUpdateSource,
 };
 pub use inbound_peer::{
     record_inbound_peer_rejection, InboundPeerProtocol, InboundPeerRejectionReason,
@@ -62,8 +75,8 @@ pub use network_recovery::{
 };
 
 pub use physical::{
-    local_connection_key, local_path_key, ConnectionLifetimeObservation, NetworkPathKind,
-    ObserverFailure, PathObservationKind,
+    local_connection_key, local_path_key, ConnectionLifetimeObservation, NegotiatedProtocol,
+    NetworkPathKind, ObserverFailure, PathObservationKind,
 };
 
 pub use address::{
@@ -192,7 +205,28 @@ fn emit_local(event: LocalEvent, context: &ObservationContext) {
 }
 
 /// 在线检查只在完整返回或被取消时结算，具体分支不各自输出日志。
+
+/// 完整 owner 只能提交固定结局；不提供业务状态或阶段查询。
+#[derive(Clone, Default)]
+pub struct PresenceCheckFeedback(Option<Arc<Mutex<Option<PresenceCheckResult>>>>);
+tokio::task_local! { static PRESENCE_FEEDBACK: PresenceCheckFeedback; }
+impl PresenceCheckFeedback {
+    pub fn capture() -> Self {
+        PRESENCE_FEEDBACK.try_with(Clone::clone).unwrap_or_default()
+    }
+    pub async fn scope<F: Future>(self, future: F) -> F::Output {
+        PRESENCE_FEEDBACK.scope(self, future).await
+    }
+}
+pub fn record_presence_check_result(result: PresenceCheckResult) {
+    let _ = PRESENCE_FEEDBACK.try_with(|feedback| {
+        if let Some(value) = &feedback.0 {
+            *value.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+        }
+    });
+}
 pub struct PresenceCheckObservation {
+    feedback: PresenceCheckFeedback,
     context: ObservationContext,
     started: Instant,
     finished: bool,
@@ -200,12 +234,22 @@ pub struct PresenceCheckObservation {
 impl PresenceCheckObservation {
     pub fn begin() -> Self {
         Self {
+            feedback: PresenceCheckFeedback(Some(Arc::new(Mutex::new(None)))),
             context: ObservationContext::capture(),
             started: Instant::now(),
             finished: false,
         }
     }
+    pub async fn scope<F: Future>(&self, future: F) -> F::Output {
+        self.feedback.clone().scope(future).await
+    }
     pub fn finish(mut self, result: PresenceCheckResult) {
+        let result = self
+            .feedback
+            .0
+            .as_ref()
+            .and_then(|value| *value.lock().unwrap_or_else(PoisonError::into_inner))
+            .unwrap_or(result);
         self.finished = true;
         emit_local(
             LocalEvent::PresenceCheck {

@@ -11,7 +11,7 @@ use crate::{
     MobileSyncSettingsPatch, PreviewConfigImportInput, ReadMobileSyncFileInput,
     RegisterMobileDeviceInput, RelayCredentialInput, RelayProbeInput,
     RevalidateMobileCredentialInput, SaveRelayInput, SettingsPatch, StageConfigImportInput,
-    UpdateDebugModeInput, UpdateMobileDeviceInput,
+    UpdateMobileDeviceInput,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +58,6 @@ pub enum OperationKind {
     QueryUpgradeStatus,
     AcknowledgeUpgrade,
     QueryDiagnostics,
-    UpdateDebugMode,
     ExportDiagnosticLogs,
     ExportConfig,
     PreviewConfigImport,
@@ -109,6 +108,14 @@ pub enum OperationKind {
     GetHistoryEntry,
     DeleteHistoryEntry,
     SetHistoryEntryFavorite,
+    ListHistoryTags,
+    CreateHistoryTag,
+    RenameHistoryTag,
+    AddHistoryTagToEntries,
+    RemoveHistoryTagFromEntries,
+    SummarizeHistoryEntryTags,
+    MergeHistoryTags,
+    DeleteHistoryTag,
     QueryHistoryStats,
     GetHistoryEntryResource,
     ReadBlob,
@@ -119,6 +126,7 @@ pub enum OperationKind {
     QueryEntryReceiveProgress,
     ListEntryReceiveProgress,
     CancelEntryReceive,
+    RetryEntryReceive,
     CancelInboundTransfer,
     CaptureCurrentClipboard,
     ObserveClipboardChange,
@@ -165,7 +173,6 @@ impl fmt::Display for OperationKind {
             Self::QueryUpgradeStatus => "query_upgrade_status",
             Self::AcknowledgeUpgrade => "acknowledge_upgrade",
             Self::QueryDiagnostics => "query_diagnostics",
-            Self::UpdateDebugMode => "update_debug_mode",
             Self::ExportDiagnosticLogs => "export_diagnostic_logs",
             Self::ExportConfig => "export_config",
             Self::PreviewConfigImport => "preview_config_import",
@@ -216,6 +223,14 @@ impl fmt::Display for OperationKind {
             Self::GetHistoryEntry => "get_history_entry",
             Self::DeleteHistoryEntry => "delete_history_entry",
             Self::SetHistoryEntryFavorite => "set_history_entry_favorite",
+            Self::ListHistoryTags => "list_history_tags",
+            Self::CreateHistoryTag => "create_history_tag",
+            Self::RenameHistoryTag => "rename_history_tag",
+            Self::AddHistoryTagToEntries => "add_history_tag_to_entries",
+            Self::RemoveHistoryTagFromEntries => "remove_history_tag_from_entries",
+            Self::SummarizeHistoryEntryTags => "summarize_history_entry_tags",
+            Self::MergeHistoryTags => "merge_history_tags",
+            Self::DeleteHistoryTag => "delete_history_tag",
             Self::QueryHistoryStats => "query_history_stats",
             Self::GetHistoryEntryResource => "get_history_entry_resource",
             Self::ReadBlob => "read_blob",
@@ -226,6 +241,7 @@ impl fmt::Display for OperationKind {
             Self::QueryEntryReceiveProgress => "query_entry_receive_progress",
             Self::ListEntryReceiveProgress => "list_entry_receive_progress",
             Self::CancelEntryReceive => "cancel_entry_receive",
+            Self::RetryEntryReceive => "retry_entry_receive",
             Self::CancelInboundTransfer => "cancel_inbound_transfer",
             Self::CaptureCurrentClipboard => "capture_current_clipboard",
             Self::ObserveClipboardChange => "observe_clipboard_change",
@@ -316,7 +332,6 @@ pub enum Operation {
     QueryUpgradeStatus,
     AcknowledgeUpgrade,
     QueryDiagnostics,
-    UpdateDebugMode(UpdateDebugModeInput),
     ExportDiagnosticLogs(ExportDiagnosticLogsInput),
     ExportConfig(ExportConfigInput),
     PreviewConfigImport(PreviewConfigImportInput),
@@ -367,6 +382,14 @@ pub enum Operation {
     GetHistoryEntry(HistoryEntryInput),
     DeleteHistoryEntry(HistoryEntryInput),
     SetHistoryEntryFavorite(SetHistoryEntryFavoriteInput),
+    ListHistoryTags,
+    CreateHistoryTag(CreateHistoryTagInput),
+    RenameHistoryTag(RenameHistoryTagInput),
+    AddHistoryTagToEntries(HistoryTagEntriesInput),
+    RemoveHistoryTagFromEntries(HistoryTagEntriesInput),
+    SummarizeHistoryEntryTags(HistoryEntryTagsInput),
+    MergeHistoryTags(MergeHistoryTagsInput),
+    DeleteHistoryTag(HistoryTagInput),
     QueryHistoryStats,
     GetHistoryEntryResource(HistoryEntryInput),
     ReadBlob(BlobResourceInput),
@@ -377,6 +400,7 @@ pub enum Operation {
     QueryEntryReceiveProgress(EntryReceiveProgressInput),
     ListEntryReceiveProgress,
     CancelEntryReceive(CancelEntryReceiveInput),
+    RetryEntryReceive(RetryEntryReceiveInput),
     CancelInboundTransfer(CancelInboundTransferInput),
     CaptureCurrentClipboard,
     ObserveClipboardChange(ObserveClipboardChangeInput),
@@ -425,7 +449,6 @@ impl Operation {
             Self::QueryUpgradeStatus => OperationKind::QueryUpgradeStatus,
             Self::AcknowledgeUpgrade => OperationKind::AcknowledgeUpgrade,
             Self::QueryDiagnostics => OperationKind::QueryDiagnostics,
-            Self::UpdateDebugMode(_) => OperationKind::UpdateDebugMode,
             Self::ExportDiagnosticLogs(_) => OperationKind::ExportDiagnosticLogs,
             Self::ExportConfig(_) => OperationKind::ExportConfig,
             Self::PreviewConfigImport(_) => OperationKind::PreviewConfigImport,
@@ -476,6 +499,14 @@ impl Operation {
             Self::GetHistoryEntry(_) => OperationKind::GetHistoryEntry,
             Self::DeleteHistoryEntry(_) => OperationKind::DeleteHistoryEntry,
             Self::SetHistoryEntryFavorite(_) => OperationKind::SetHistoryEntryFavorite,
+            Self::ListHistoryTags => OperationKind::ListHistoryTags,
+            Self::CreateHistoryTag(_) => OperationKind::CreateHistoryTag,
+            Self::RenameHistoryTag(_) => OperationKind::RenameHistoryTag,
+            Self::AddHistoryTagToEntries(_) => OperationKind::AddHistoryTagToEntries,
+            Self::RemoveHistoryTagFromEntries(_) => OperationKind::RemoveHistoryTagFromEntries,
+            Self::SummarizeHistoryEntryTags(_) => OperationKind::SummarizeHistoryEntryTags,
+            Self::MergeHistoryTags(_) => OperationKind::MergeHistoryTags,
+            Self::DeleteHistoryTag(_) => OperationKind::DeleteHistoryTag,
             Self::QueryHistoryStats => OperationKind::QueryHistoryStats,
             Self::GetHistoryEntryResource(_) => OperationKind::GetHistoryEntryResource,
             Self::ReadBlob(_) => OperationKind::ReadBlob,
@@ -486,6 +517,7 @@ impl Operation {
             Self::QueryEntryReceiveProgress(_) => OperationKind::QueryEntryReceiveProgress,
             Self::ListEntryReceiveProgress => OperationKind::ListEntryReceiveProgress,
             Self::CancelEntryReceive(_) => OperationKind::CancelEntryReceive,
+            Self::RetryEntryReceive(_) => OperationKind::RetryEntryReceive,
             Self::CancelInboundTransfer(_) => OperationKind::CancelInboundTransfer,
             Self::CaptureCurrentClipboard => OperationKind::CaptureCurrentClipboard,
             Self::ObserveClipboardChange(_) => OperationKind::ObserveClipboardChange,
@@ -841,6 +873,60 @@ pub struct SetHistoryEntryFavoriteInput {
     pub is_favorited: bool,
 }
 
+/// 按名称创建历史标签；同名（规范化后忽略大小写）时返回已有标签。
+#[derive(Clone, PartialEq, Eq)]
+pub struct CreateHistoryTagInput {
+    pub name: String,
+}
+
+impl fmt::Debug for CreateHistoryTagInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CreateHistoryTagInput")
+            .field("name", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RenameHistoryTagInput {
+    pub tag_id: String,
+    pub name: String,
+}
+
+impl fmt::Debug for RenameHistoryTagInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RenameHistoryTagInput")
+            .field("name", &"[REDACTED]")
+            .finish_non_exhaustive()
+    }
+}
+
+/// 把一个历史标签关联到一组条目，或从一组条目移除。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryTagEntriesInput {
+    pub tag_id: String,
+    pub entry_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntryTagsInput {
+    pub entry_ids: Vec<String>,
+}
+
+/// 把来源标签并入目标标签；来源标签随后删除。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeHistoryTagsInput {
+    pub source_tag_ids: Vec<String>,
+    pub target_tag_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryTagInput {
+    pub tag_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryReceiveProgressInput {
     pub entry_id: String,
@@ -850,6 +936,13 @@ pub struct EntryReceiveProgressInput {
 pub struct CancelEntryReceiveInput {
     pub entry_id: String,
     pub attempt_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryEntryReceiveInput {
+    pub entry_id: String,
+    pub expected_attempt_id: String,
+    pub item_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

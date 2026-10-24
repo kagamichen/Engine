@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::events::{transfer_progress, OhPeerPresence, OhReceiveAttempt, OhTransferStatus};
-use crate::observability::schedule_flush_after_success;
+use crate::observability::schedule_flush_after_lifecycle;
 use crate::security::profile_recovery;
 use crate::settings::settings_section;
 use napi::bindgen_prelude::Uint8Array;
@@ -12,18 +12,19 @@ use uc_engine::observability::uc_warn;
 use uc_engine::{
     CancelJoinSpaceInput, ChangeEncryptionPassphraseInput, ChooseDeviceGroupInput,
     ClipboardRestoreMode, ClipboardRestoreOutcome, CreateSpaceInput, Engine, EngineConfig,
-    EngineError, EngineEvent, EngineState, EventStream, ExportEntryInput, HostFileHandle,
-    InvitationAvailability, JoinSpaceInput, Operation, OperationResult, OperationTerminal,
-    RecoverSessionInput, RefreshReason, RemoveMemberInput, RestoreClipboardInput, SecretString,
-    SendFilesInput, SendImageInput, SendReportSummary, SendTextInput, StartupLifecycle,
-    StartupLifecycleInput, StartupProgress,
+    EngineError, EngineEvent, EngineState, EntryReceiveRetryOutcome, EventStream, ExportEntryInput,
+    HostFileHandle, InvitationAvailability, JoinSpaceInput, Operation, OperationResult,
+    OperationTerminal, RecoverSessionInput, RefreshReason, RemoveMemberInput,
+    RestoreClipboardInput, RetryEntryReceiveInput, SecretString, SendFilesInput, SendImageInput,
+    SendReportSummary, SendTextInput, StartupLifecycle, StartupLifecycleInput, StartupProgress,
 };
 use zeroize::Zeroizing;
 
 use crate::{
     host, OhActiveClipboard, OhEngineConfig, OhEngineEvent, OhHost, OhInvitationIssued,
-    OhJoinSpaceStatus, OhJoinedSpace, OhLocalDevice, OhNetworkRecoveryStatus, OhRelayOverview,
-    OhRelayOverviewEntry, OhSendReport, OhSessionRecovery, OhSpaceCreated,
+    OhJoinSpaceStatus, OhJoinedSpace, OhLocalDevice, OhNetworkRecoveryStatus,
+    OhReceiveRetryOutcome, OhRelayOverview, OhRelayOverviewEntry, OhSendReport, OhSessionRecovery,
+    OhSpaceCreated,
 };
 
 #[napi]
@@ -472,6 +473,29 @@ impl OhEngine {
         }
     }
 
+    /// 接受后实际接收由Engine持有，宿主不编排获取和提交。
+    #[napi]
+    pub async fn retry_entry_receive(
+        &self,
+        entry_id: String,
+        expected_attempt_id: String,
+        item_ids: Vec<String>,
+    ) -> napi::Result<OhReceiveRetryOutcome> {
+        match self
+            .engine
+            .execute(Operation::RetryEntryReceive(RetryEntryReceiveInput {
+                entry_id,
+                expected_attempt_id,
+                item_ids,
+            }))
+            .await
+            .map_err(engine_error)?
+        {
+            OperationResult::EntryReceiveRetry(outcome) => Ok(receive_retry(outcome)),
+            _ => Err(unexpected_result()),
+        }
+    }
+
     #[napi]
     pub async fn query_active_clipboard(&self) -> napi::Result<Option<OhActiveClipboard>> {
         let result = self
@@ -565,7 +589,7 @@ impl OhEngine {
     #[napi]
     pub async fn suspend(&self) -> napi::Result<()> {
         let result = self.engine.suspend().await.map_err(engine_error);
-        schedule_flush_after_success(&result);
+        schedule_flush_after_lifecycle();
         result
     }
 
@@ -576,7 +600,7 @@ impl OhEngine {
             .suspend_with_deadline(Duration::from_millis(u64::from(deadline_ms)))
             .await
             .map_err(engine_error);
-        schedule_flush_after_success(&result);
+        schedule_flush_after_lifecycle();
         result
     }
 
@@ -608,7 +632,7 @@ impl OhEngine {
             .shutdown(Duration::from_millis(u64::from(deadline_ms)))
             .await
             .map_err(engine_error);
-        schedule_flush_after_success(&result);
+        schedule_flush_after_lifecycle();
         result
     }
 
@@ -619,7 +643,7 @@ impl OhEngine {
             .shutdown_until_complete()
             .await
             .map_err(engine_error);
-        schedule_flush_after_success(&result);
+        schedule_flush_after_lifecycle();
         result
     }
 }
@@ -728,6 +752,9 @@ fn join_space_status(result: OperationResult) -> napi::Result<OhJoinSpaceStatus>
                     uc_engine::JoinSpaceAttentionReasonSummary::OutcomeCannotBeProven => {
                         "outcome_cannot_be_proven"
                     }
+                    uc_engine::JoinSpaceAttentionReasonSummary::ContinuationUnavailable => {
+                        "continuation_unavailable"
+                    }
                 }
                 .to_owned(),
             ),
@@ -735,6 +762,9 @@ fn join_space_status(result: OperationResult) -> napi::Result<OhJoinSpaceStatus>
                 match recovery {
                     uc_engine::JoinSpaceAttentionRecoverySummary::PreserveDataAndContactSupport => {
                         "preserve_data_and_contact_support"
+                    }
+                    uc_engine::JoinSpaceAttentionRecoverySummary::RestartWithNewInvitation => {
+                        "restart_with_new_invitation"
                     }
                 }
                 .to_owned(),
@@ -757,6 +787,9 @@ fn join_space_status(result: OperationResult) -> napi::Result<OhJoinSpaceStatus>
                     }
                     uc_engine::JoinSpaceRejectionReasonSummary::AuthenticationRejected => {
                         "authentication_rejected"
+                    }
+                    uc_engine::JoinSpaceRejectionReasonSummary::SponsorUnresponsive => {
+                        "sponsor_unresponsive"
                     }
                     uc_engine::JoinSpaceRejectionReasonSummary::IdentityConflict => {
                         "identity_conflict"
@@ -1276,6 +1309,7 @@ mod tests {
                 compatibility: uc_engine::DeviceCompatibilitySummary::Compatible,
                 sync_relationship: uc_engine::DeviceSyncRelationshipSummary::Usable,
                 pairing_confirmation: Some(uc_engine::PairingConfirmationSummary::Unconfirmed),
+                group_update: None,
                 available_actions: Vec::new(),
                 blocked_reason: None,
             });
@@ -1311,5 +1345,22 @@ fn relay_mode_name(mode: uc_engine::RelayRoutingMode) -> &'static str {
         uc_engine::RelayRoutingMode::BuiltIn => "built_in",
         uc_engine::RelayRoutingMode::Custom => "custom",
         uc_engine::RelayRoutingMode::Disabled => "disabled",
+    }
+}
+
+fn receive_retry(outcome: EntryReceiveRetryOutcome) -> OhReceiveRetryOutcome {
+    let (status, attempt_id, reason) = match outcome {
+        EntryReceiveRetryOutcome::Accepted { attempt_id } => ("accepted", Some(attempt_id), None),
+        EntryReceiveRetryOutcome::AlreadyReceiving => ("already_receiving", None, None),
+        EntryReceiveRetryOutcome::Superseded => ("superseded", None, None),
+        EntryReceiveRetryOutcome::CancellationIncomplete => ("cancellation_incomplete", None, None),
+        EntryReceiveRetryOutcome::Unavailable { reason } => {
+            ("unavailable", None, Some(reason.to_string()))
+        }
+    };
+    OhReceiveRetryOutcome {
+        status: status.into(),
+        attempt_id,
+        reason,
     }
 }

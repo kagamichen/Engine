@@ -206,6 +206,61 @@ async fn authentication_rejection_diagnostic_explains_trigger_reason_and_outcome
 }
 
 #[tokio::test]
+async fn continuation_record_missing_stops_retrying_and_exposes_a_distinct_recovery_state() {
+    let output_file = tempfile::NamedTempFile::new().expect("diagnostic output");
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_writer(std::sync::Mutex::new(output_file.reopen().expect("writer")))
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let pair =
+        SpaceAdmissionProtocolTestPair::continuation_record_missing_after_authentication().await;
+    pair.joiner()
+        .start_join_at(join_input("continuation-record-missing"), 1_000)
+        .await
+        .expect("the join request should be saved before recovery");
+
+    let report = pair
+        .joiner()
+        .recover_pending(AdmissionRecoveryTrigger::StateChanged)
+        .await;
+
+    // 握手已经成功过一次；真正失败的是续传阶段，必须落在 recovery_required 而不是
+    // deferred_count——否则会像真实 bug 一样被后续维护轮次无限重试同一个死局。
+    assert_eq!(report.recovery_required_count, 1, "report: {report:?}");
+    assert_eq!(report.deferred_count, 0, "report: {report:?}");
+    assert_eq!(pair.active_joiner_observation_count(), 0);
+
+    let saved = pair.take_created_join();
+    assert!(saved.needs_attention());
+    assert_eq!(
+        saved.recovery_category(),
+        Some(uc_core::membership::AdmissionRecoveryCategory::MissingKey)
+    );
+
+    // 再跑一轮维护，确认终态不会继续发起网络请求（不会死循环）。
+    let continuation_attempts_before = pair
+        .events()
+        .iter()
+        .filter(|event| matches!(event, ProtocolEvent::JoinerContinuationChannelRequested))
+        .count();
+    assert_eq!(continuation_attempts_before, 1);
+
+    let diagnostics = std::fs::read_to_string(output_file.path()).expect("diagnostics");
+    for expected in [
+        "pairing.recovery.decided",
+        "requires_recovery",
+        "missing_credential",
+    ] {
+        assert!(
+            diagnostics.contains(expected),
+            "diagnostic output must contain {expected}: {diagnostics}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn short_code_resolution_is_marked_started_once_and_saves_the_full_invitation() {
     let pair = SpaceAdmissionProtocolTestPair::short_invitation().await;
     pair.joiner()
@@ -358,6 +413,29 @@ async fn authenticated_old_layout_is_persisted_as_an_explicit_upgrade_rejection(
             ProtocolEvent::JoinerJoinRequestExchanged,
             ProtocolEvent::JoinerRejectedPeerUpgrade,
         ]
+    );
+}
+
+/// Sponsor 无应答是独立的拒绝原因，不能被保存成认证失败（口令错误）。
+#[tokio::test]
+async fn an_unresponsive_sponsor_is_saved_as_its_own_rejection_reason() {
+    let pair = SpaceAdmissionProtocolTestPair::sponsor_unresponsive().await;
+    pair.joiner()
+        .start_join_at(join_input("sponsor-unresponsive"), 1_000)
+        .await
+        .expect("the join request should be saved before recovery");
+
+    let report = pair
+        .joiner()
+        .recover_pending(AdmissionRecoveryTrigger::StateChanged)
+        .await;
+
+    assert_eq!(report.rejected_count, 1);
+    assert_eq!(report.deferred_count, 0);
+    assert_eq!(pair.active_joiner_observation_count(), 0);
+    assert_eq!(
+        pair.take_created_join().rejection_reason(),
+        Some(uc_core::membership::SpaceAdmissionRejectionReason::SponsorUnresponsive)
     );
 }
 
@@ -1029,4 +1107,41 @@ fn abandonment_attempts(pair: &SpaceAdmissionProtocolTestPair) -> usize {
         .iter()
         .filter(|event| matches!(event, ProtocolEvent::JoinerAbandonmentExchanged))
         .count()
+}
+
+/// 早于尝试期限格式写入的邀请方记录（合成字节，经真实 Core 编码器生成）。
+fn legacy_sponsor(hex: &str) -> uc_core::membership::SponsorAdmission {
+    let hex = hex.trim();
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("hex fixture"))
+        .collect();
+    uc_core::membership::SponsorAdmission::decode_persisted(&bytes)
+        .expect("legacy sponsor fixture decodes")
+}
+
+#[tokio::test]
+async fn legacy_sponsor_without_deadline_is_closed_when_the_ledger_has_no_member() {
+    for hex in [
+        include_str!("fixtures/legacy_sponsor_candidate.hex"),
+        include_str!("fixtures/legacy_sponsor_committed.hex"),
+        include_str!("fixtures/legacy_sponsor_applied.hex"),
+    ] {
+        let pair = SpaceAdmissionProtocolTestPair::fresh().await;
+        let legacy = legacy_sponsor(hex);
+        assert!(legacy.is_legacy_unbounded());
+        pair.seed_sponsor(legacy);
+
+        let report = pair.recover_sponsor().await;
+
+        assert_eq!(report.advanced_count, 1);
+        assert_eq!(report.recovery_required_count, 0);
+        assert_eq!(report.deferred_count, 0);
+        assert!(pair.sponsor_is_terminal());
+        let again = pair.recover_sponsor().await;
+        assert_eq!(
+            again.advanced_count, 0,
+            "a closed record is not closed twice"
+        );
+    }
 }

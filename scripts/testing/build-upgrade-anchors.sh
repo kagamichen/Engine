@@ -11,7 +11,11 @@
 # 补丁只允许改宿主与工作区成员声明。产物位于 <target>/upgrade-anchors/<rev>/bin/uc-connectivity-host，host.json 记录
 # 缓存键、补丁摘要与构建耗时；缓存键不变时直接复用。构建并行度沿用当前仓库的设置（本地为
 # .cargo/config.toml 的 jobs，CI 由 rust-ci-setup 设置 CARGO_BUILD_JOBS），并关闭增量编译。
+# 每个快照使用自己工作目录的规范 target；`--clean` 一并回收它们。
 set -euo pipefail
+
+# 当前脚本与所有嵌套 Cargo 调用统一经由 MBX。
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../build-cache/env.sh"
 
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$repo"
@@ -66,14 +70,15 @@ host_source_digest() {
   } | sha256
 }
 
-root="$(target_directory)/upgrade-anchors"
+shared_target="$(target_directory)"
+root="$shared_target/upgrade-anchors"
 
 if [[ "${1:-}" == --clean ]]; then
   [[ -d "$root" ]] || exit 0
   for source in "$root"/*/src; do
     [[ -f "$source/Cargo.toml" ]] || continue
     build=$(target_directory --manifest-path "$source/Cargo.toml" 2>/dev/null || true)
-    if [[ -n "$build" && "$build" != "$root"* && -d "$build" ]]; then rm -rf -- "$build"; fi
+    if [[ -n "$build" && "$build" != "$shared_target" && "$build" != "$root"* && -d "$build" ]]; then rm -rf -- "$build"; fi
   done
   rm -rf -- "$root"
   printf 'removed %s\n' "$root"
@@ -100,6 +105,17 @@ fetch_rev() {
 }
 
 mkdir -p "$root"
+# 旧构建共用 target 时会写同名 bin；复制当前宿主并在结束时还原，矩阵不得把旧宿主当 HEAD。
+current_host="$shared_target/debug/uc-connectivity-host"
+current_backup="$root/current-host-backup-$$"
+if [[ -f "$current_host" ]]; then cp "$current_host" "$current_backup"; fi
+restore_current_host() {
+  if [[ -f "$current_backup" ]]; then
+    cp "$current_backup" "$current_host"
+    rm -f -- "$current_backup"
+  fi
+}
+trap restore_current_host EXIT
 status=0
 for id in "${ids[@]}"; do
   rev=$(anchor_field "$id" engine_rev) || { printf 'unknown anchor: %s\n' "$id" >&2; exit 2; }
@@ -143,19 +159,31 @@ for id in "${ids[@]}"; do
   lock_before=$(sha256 <"$source/Cargo.lock")
   log="$out/build.log"
   build_status=0
+  # 快照是独立的工作目录，编译输出使用它自己的规范 target：由调用环境经 `cargo metadata` 决定
+  # （受管编译盘按工作目录分配，CI 则沿用其统一设置），不借用当前仓库的 target。
+  # 受管环境按工作目录隔离输出，借用他树的 target 会被拒绝，也会让 Cargo 按 mtime 误判产物为最新。
+  build=$(target_directory --manifest-path "$source/Cargo.toml") || build=
+  if [[ -z "$build" ]]; then
+    printf '%s %s: cannot resolve the snapshot build directory\n' "$id" "${rev:0:12}" >"$log"
+    printf '%s %s: build failed, see %s\n' "$id" "${rev:0:12}" "$log" >&2
+    status=1
+    continue
+  fi
+  # 共享 target 时主动刷新快照时间戳；源码字节不变，不能把另一快照误判 fresh。
+  find "$source" -type f -name '*.rs' -exec touch {} +
   (
     cd "$source"
     cargo fetch --quiet
     # 旧版宿主来自锚点 rev 的源码快照并覆盖了当前宿主，如实记录构建来源，不沿用调用方为当前树设置的值。
-    # 快照构建目录用完即删，增量编译没有复用价值，关闭后各 rev 的工作区 crate 才能命中共享编译缓存，
+    # 旧快照关闭增量编译，避免各 rev 的增量图相互覆盖；仍使用根 target 和共享编译缓存，
     # 只改宿主时不必整棵重编。诊断只输出单行：rustc 1.95.0 在 x86_64 Linux 上渲染 A03 的 dead code 警告片段时
     # 内部崩溃（annotate_snippet_emitter 切片越界），旧版源码的警告本就不需要完整片段。
     UC_HOST_ANCHOR="$id" UC_HOST_ENGINE_REV="$rev" \
       UC_ENGINE_SOURCE_COMMIT="$rev" UC_ENGINE_SOURCE_STATE=modified \
+      CARGO_TARGET_DIR="$build" CARGO_PROFILE_DEV_DEBUG=0 \
       CARGO_BUILD_JOBS="$build_jobs" CARGO_INCREMENTAL=0 \
       cargo build --offline --message-format short -p uc-connectivity-host --no-default-features --features "$features"
   ) >"$log" 2>&1 || build_status=$?
-  build=$(target_directory --manifest-path "$source/Cargo.toml")
   elapsed=$(($(date +%s) - started))
   if ((build_status != 0)); then
     printf '%s %s: build failed after %ss, see %s\n' "$id" "${rev:0:12}" "$elapsed" "$log" >&2
@@ -164,8 +192,9 @@ for id in "${ids[@]}"; do
   fi
   cp "$build/debug/uc-connectivity-host" "$binary"
   lock_after=$(sha256 <"$source/Cargo.lock")
-  # 旧版构建目录体积大且可由共享编译缓存快速重建，产物复制后即回收。
-  if [[ "$build" != "$root"* ]]; then rm -rf -- "$build"; else rm -rf -- "$source/target"; fi
+  # 依赖编译由共享编译缓存复用；快照 target 位于编译盘，可由 `--clean` 回收。
+  # 快照源码树内的 target 不保留。
+  rm -rf -- "$source/target"
   cat >"$out/host.json" <<JSON
 {
   "anchor": "$id",

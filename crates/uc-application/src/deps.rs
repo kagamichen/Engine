@@ -3,9 +3,18 @@
 //! 定义 Application 对象图所需的依赖分组。这些类型只负责打包必需参数，
 //! 不提供分步构建、默认值或隐式装配逻辑，因此不是 Builder。
 
+use crate::clipboard::history::clear_history::HistoryDeletionTargetsPort;
+pub use crate::clipboard::history::resource_snapshot::{
+    EntryResourceReadError, EntryResourceSnapshot, ReadEntryResourceSnapshotPort,
+};
+use crate::clipboard::history_tags::{HistoryEntryTagReaderPort, HistoryTagStorePort};
+pub use crate::transfer::receive::retry::{
+    BeginReceiveRetryInput, BeginReceiveRetryPort, ReceiveRetryItem, ReceiveRetryItemState,
+};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uc_core::blob::ports::{BlobContentIngestPort, BlobReaderPort, BlobWriterPort};
+use uc_core::diagnostics::HostLogProfile;
 use uc_core::ids::RepresentationId;
 use uc_core::membership::GroupRevocationPort;
 use uc_core::ports::clipboard::{
@@ -28,6 +37,11 @@ use uc_core::ports::*;
 use uc_core::MemberRepositoryPort;
 use uc_observability_contract::analytics::AnalyticsPort;
 
+pub use crate::discovery::{
+    BackendId, ConnectionCandidate, DiscoveredPeer, DiscoveryError, DiscoveryEvent,
+    DiscoveryManager, DiscoveryPeerId, DiscoveryProvider, DiscoveryProviderId, DiscoveryStream,
+    PeerDirectory,
+};
 pub use crate::space::{KnownPeerIdentity, PeerAccess, PeerIdentityDirectoryPort};
 
 pub use crate::application::{
@@ -80,28 +94,29 @@ pub use crate::space::{
     JoinerCancellationMaterial, JoinerCancellationMaterialError, JoinerCancellationMutation,
     JoinerCancellationStateError, JoinerMembershipStart, JoinerStartMaterial,
     JoinerStartMaterialError, JoinerStartMaterialPort, JoinerStartMutation, JoinerStartStateError,
-    JoinerStartStatePort, LoadedAdmissionRecovery, LoadedCurrentJoin, LoadedJoinerActivation,
-    LoadedJoinerStartState, LoadedPendingAdmission, LoadedSponsorAbandonment,
-    LoadedSponsorAdmission, LoadedSponsorDeadline, PendingAdmissionRecoveryStateError,
-    PendingAdmissionRecoveryStatePort, PrepareJoinerActivationError, PrepareJoinerActivationPort,
-    PrepareJoinerAppliedError, PrepareJoinerAppliedPort, PrepareJoinerCancellationPort,
-    PrepareJoinerCandidateError, PrepareJoinerCandidatePort, PrepareJoinerInvitationError,
-    PrepareJoinerInvitationPort, PrepareSponsorAdmissionSecurityPort, PrepareSponsorCandidateError,
-    PrepareSponsorCandidatePort, PrepareSponsorCommitError, PrepareSponsorCommitPort,
-    PrepareSponsorCompleteError, PrepareSponsorCompletePort, PrepareSponsorSettledError,
-    PrepareSponsorSettledPort, PreparedJoinerActivation, PreparedJoinerAppliedMaterial,
-    PreparedJoinerCandidateMaterial, PreparedJoinerInvitation, PreparedMemberSecurityDelivery,
-    PreparedSponsorCandidate, PreparedSponsorCommit, PreparedSponsorComplete,
-    PreparedSponsorSettled, RePairingStateError, RePairingStateStorePort, RebindSpaceSessionPort,
-    RecoverMembershipEffectsPort, RecoverSpaceAdmissionsPort, ResolveJoinerInvitationError,
-    ResolveJoinerInvitationPort, RestrictedMembershipDelivery, RestrictedMembershipDeliveryError,
+    JoinerStartStatePort, JoinerTransportMaterial, JoinerTransportMaterialPort,
+    LoadedAdmissionRecovery, LoadedCurrentJoin, LoadedJoinerActivation, LoadedJoinerStartState,
+    LoadedPendingAdmission, LoadedSponsorAbandonment, LoadedSponsorAdmission,
+    LoadedSponsorDeadline, PendingAdmissionRecoveryStateError, PendingAdmissionRecoveryStatePort,
+    PrepareJoinerActivationError, PrepareJoinerActivationPort, PrepareJoinerAppliedError,
+    PrepareJoinerAppliedPort, PrepareJoinerCancellationPort, PrepareJoinerCandidateError,
+    PrepareJoinerCandidatePort, PrepareJoinerInvitationError, PrepareJoinerInvitationPort,
+    PrepareSponsorAdmissionSecurityPort, PrepareSponsorCandidateError, PrepareSponsorCandidatePort,
+    PrepareSponsorCommitError, PrepareSponsorCommitPort, PrepareSponsorCompleteError,
+    PrepareSponsorCompletePort, PrepareSponsorSettledError, PrepareSponsorSettledPort,
+    PreparedJoinerActivation, PreparedJoinerAppliedMaterial, PreparedJoinerCandidateMaterial,
+    PreparedJoinerInvitation, PreparedMemberSecurityDelivery, PreparedSponsorCandidate,
+    PreparedSponsorCommit, PreparedSponsorComplete, PreparedSponsorSettled, RePairingStateError,
+    RePairingStateStorePort, RebindSpaceSessionPort, RecoverMembershipEffectsPort,
+    RecoverSpaceAdmissionsPort, ResolveJoinerInvitationError, ResolveJoinerInvitationPort,
+    RestrictedMembershipDelivery, RestrictedMembershipDeliveryError,
     RestrictedMembershipDeliveryPort, ResumeSpaceSessionPort, SpaceActivityError,
     SpaceAdmissionCommitToken, SpaceAdmissionMessageReply, SpaceAdmissionTransportError,
     SpaceAdmissionTransportPort, SpaceMemberPauseReason, SponsorAdmissionCommitToken,
     SponsorAdmissionMutation, SponsorAdmissionSecurityRecipient, SponsorAdmissionSecurityRequest,
     SponsorAdmissionState, SponsorAdmissionStateError, SponsorAdmissionStatePort,
-    SponsorPreparedAdmissionSecurity, SponsorPreparedSecurityTransition,
-    ValidateJoinerActivationIntentPort,
+    SponsorContinuationRoutePort, SponsorPreparedAdmissionSecurity,
+    SponsorPreparedSecurityTransition, ValidateJoinerActivationIntentPort,
 };
 pub use crate::space::{
     AdmissionDisplayStatus, AdvanceMembershipBranchTransitionError,
@@ -136,7 +151,6 @@ pub use crate::space::{
     SpaceMembershipRecord,
 };
 pub use crate::space::{SpaceAdmissionAdapters, SpaceMembershipAdapters, SpaceRuntimeAdapters};
-pub use crate::transfer::file::assembly::ReceiveCancellationDeps;
 pub use crate::transfer::file::facade::FileTransferFacadeDeps;
 pub use crate::transfer::file::lifecycle::FileTransferLifecycleDeps;
 pub use crate::transfer::receive::reconciliation::ReceiveReadinessCoordinator;
@@ -156,6 +170,8 @@ pub struct ClipboardEntryPorts {
     pub get: Arc<dyn GetClipboardEntryPort>,
     /// 以倒序分页方式列出剪贴板条目。
     pub list: Arc<dyn ListClipboardEntriesPort>,
+    /// 清空覆盖的历史与接收状态标识，不读取正文。
+    pub list_for_deletion: Arc<dyn HistoryDeletionTargetsPort>,
     /// 原子保存条目及其表示选择决策。
     pub save: Arc<dyn SaveClipboardEntryPort>,
     /// 更新已有条目的最后活跃时间。
@@ -202,6 +218,8 @@ pub struct ClipboardRepresentationPorts {
 /// 剪贴板领域端口组。
 #[derive(Clone)]
 pub struct ClipboardPorts {
+    /// 一致读取资源所需的当前选择及认证后表示。
+    pub resource_snapshot: Arc<dyn ReadEntryResourceSnapshotPort>,
     pub history_file_references:
         Arc<dyn crate::facade::clipboard_history::HistoryFileReferencePort>,
     /// 读取平台剪贴板快照的端口。
@@ -380,6 +398,8 @@ pub struct DirectoryReceivePorts {
     pub get_publish: Arc<dyn GetDirectoryPublishRecordPort>,
     /// 开始首次接收，或在重投时替换精确匹配的已终结 attempt。
     pub begin_receive: Arc<dyn BeginReceiveAttemptPort>,
+    /// 原子接受手动重试及其完整逐项初态。
+    pub begin_retry: Arc<dyn BeginReceiveRetryPort>,
     /// 将精确匹配且正在接收的 attempt 领取为提交结算负责人。
     pub claim_commit: Arc<dyn ClaimReceiveCommitPort>,
     /// 请求取消接收 attempt，但不直接完成结算。
@@ -409,6 +429,10 @@ pub struct StoragePorts {
     pub blob_content_ingest: Arc<dyn BlobContentIngestPort>,
     /// 持久化由捕获流程构建的文件类条目逐项清单。
     pub entry_file_set_repo: Arc<dyn EntryFileSetRepositoryPort>,
+    /// 本机历史标签定义与关联的权威存储。
+    pub history_tag_store: Arc<dyn HistoryTagStorePort>,
+    /// 读取条目携带的历史标签 id；与 `history_tag_store` 来自同一个存储。
+    pub history_entry_tags: Arc<dyn HistoryEntryTagReaderPort>,
     /// 持久化与读取条目缩略图的端口。
     pub thumbnail_repo: Arc<dyn ThumbnailRepositoryPort>,
     /// 从剪贴板内容生成缩略图的端口。
@@ -499,6 +523,8 @@ pub struct SystemPorts {
 pub struct ApplicationDeps {
     /// Application 稳定目录输入；领域 assembly 不再向 Engine 重新请求路径。
     pub paths: crate::facade::AppPaths,
+    /// 宿主声明的、本进程实际安装的日志档位；诊断只原样报告。
+    pub host_log_profile: Option<HostLogProfile>,
     /// Engine 选择的 relay 连通性诊断端口；Settings 决定是否及如何使用。
     pub relay_diagnostic: Option<Arc<dyn crate::settings::RelayDiagnosticPort>>,
     /// Application 内部各领域 assembly 共享的宿主事件出口。
@@ -547,8 +573,59 @@ pub struct ApplicationDeps {
     pub search: SearchPorts,
     /// 接收产品分析事件的横切上报端口。
     ///
-    /// 组合根使用带开关的 observer 包装具体 sink。调用方只需提交事件，
-    /// 不需重复查询 `usage_analytics_enabled`。
+    /// 组合根使用带开关的 observer 包装具体 sink，开关由宿主的产品分析许可决定。
+    /// 调用方只需提交事件，不需重复查询许可。
     pub analytics: Arc<dyn AnalyticsPort>,
 }
 pub use crate::space::MembershipProjectionPlan;
+pub use crate::space::{
+    ApplyGroupUpdatePort, GroupUpdateApplyError, GroupUpdateEndpoint, GroupUpdateIncoming,
+    GroupUpdateLocalWorkPort, GroupUpdateReceiveOutcome, GroupUpdateReceiverPort,
+    GroupUpdateRecoveryRecord, GroupUpdateWirePort, GroupUpdateWork, PreparedGroupUpdate,
+    VerifiedHistoryGroupUpdate,
+};
+
+pub use crate::connectivity::{
+    AdmissionAttempt, AdmissionGrant, ConnectionLease, ConnectionMode, ConnectionProtocol,
+    ConnectionRequest, ConnectivityBackend, ConnectivityError, ConnectivityManager,
+    ConnectivityPolicy, IdleRetentionPolicy, InboundAdmissionFence, InboundAdmissionPolicy,
+    InboundConnectionError, InboundIdentityReservation, PeerConnection, PeerReceiveStream,
+    PeerSendStream, PendingInboundLease, SessionConnectionAdmissionPort, StreamLease, StreamPair,
+    StreamWorkLease,
+};
+
+// 测试装配参数只经被动依赖入口公开，不进入业务门面白名单。
+#[cfg(feature = "test-support")]
+pub use crate::transfer::blob::facade::BlobTransferDeps;
+pub use crate::transfer::blob::transport::{
+    BlobDownloadResources, BlobExchangeError, BlobExchangeFailure, BlobExchangePort,
+    BlobReadStorePort, BlobReceived, BlobRetainedContent, BlobShutdownWait, BlobSource,
+    BlobSourcePort, BlobStoreLifecyclePort, BlobTransport, BlobValidatedProgress,
+};
+
+pub use crate::space::{
+    membership_history_purpose, HistoryConnectionRetentionPort, HistoryIncoming,
+    HistoryLocalWorkPort, HistoryPeerBindingPort, HistoryReceiverPort, HistoryReply,
+    HistoryWirePort, HistoryWork, MembershipHistoryReceiver, MembershipHistoryTransport,
+};
+
+// 当前剪贴板仅向内部组装导出完整网络能力。
+pub use crate::clipboard::active::transport::{
+    ActiveClipboardTransportError, ActiveClipboardWirePort, ActiveStateMessage,
+    ActiveStateReceiver, ActiveStateReceiverPort, ActiveStateSender, ACTIVE_EXCHANGE_TIMEOUT,
+};
+
+pub use crate::clipboard::active::transport::{
+    ActivePullPreparationCancelled, ActivePullPreparationError, ActivePullPreparationPort,
+    ActivePullPreparationStop,
+};
+
+pub use crate::clipboard::active::transport::{
+    ActivePullClient, ActivePullLocalWorkPort, ActivePullReceiver, ActivePullReceiverPort,
+    ActivePullResponse, ActivePullWork,
+};
+
+pub use crate::space::{
+    PeerReachabilityEnvironmentPort, PeerReachabilityTransport, PeerReachabilityTransportError,
+    PeerReachabilityTransportPorts, PeerReachabilityWireError, PeerReachabilityWirePort,
+};

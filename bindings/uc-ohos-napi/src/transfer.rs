@@ -92,6 +92,9 @@ impl OhEngine {
             OperationResult::InboundTransferCancellation(outcome) => Ok(match outcome {
                 InboundTransferCancellationOutcome::Cancelled => "cancelled",
                 InboundTransferCancellationOutcome::NotInflight => "not_inflight",
+                InboundTransferCancellationOutcome::CancellationIncomplete => {
+                    "cancellation_incomplete"
+                }
             }
             .to_owned()),
             _ => Err(unexpected_result()),
@@ -106,6 +109,7 @@ fn cancellation(outcome: EntryReceiveCancellationOutcome) -> &'static str {
         EntryReceiveCancellationOutcome::TooLate => "too_late",
         EntryReceiveCancellationOutcome::AlreadyTerminal => "already_terminal",
         EntryReceiveCancellationOutcome::Superseded => "superseded",
+        EntryReceiveCancellationOutcome::CancellationIncomplete => "cancellation_incomplete",
     }
 }
 
@@ -135,6 +139,7 @@ mod tests {
             completed_bytes: i64::MAX - 1,
             items_total: 2,
             items_completed: 1,
+            items: Vec::new(),
         });
         assert_eq!(mapped.total_bytes, "9223372036854775807");
         assert_eq!(mapped.completed_bytes, "9223372036854775806");
@@ -155,6 +160,10 @@ mod tests {
                 "already_terminal",
             ),
             (EntryReceiveCancellationOutcome::Superseded, "superseded"),
+            (
+                EntryReceiveCancellationOutcome::CancellationIncomplete,
+                "cancellation_incomplete",
+            ),
         ] {
             assert_eq!(cancellation(outcome), expected);
         }

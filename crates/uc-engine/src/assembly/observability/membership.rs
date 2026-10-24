@@ -4,13 +4,102 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tracing::Instrument;
 use uc_application::deps::{
+    ConnectionLease, GroupUpdateReceiveOutcome, GroupUpdateReceiverPort,
     RestrictedMembershipDelivery, RestrictedMembershipDeliveryError,
     RestrictedMembershipDeliveryPort, SpaceMembershipAdapters,
 };
 use uc_core::ids::DeviceId;
+use uc_core::membership::KeyEpochError;
+use uc_infra_security::group_update_failure_detail;
+use uc_observability_contract::diagnostics::connectivity::{
+    complete_group_update_failure, GroupUpdatePhase,
+};
+
+fn observe_group_update_receive(
+    inner: Arc<dyn GroupUpdateReceiverPort>,
+) -> Arc<dyn GroupUpdateReceiverPort> {
+    Arc::new(ObservedGroupUpdateReceive { inner })
+}
+struct ObservedGroupUpdateReceive {
+    inner: Arc<dyn GroupUpdateReceiverPort>,
+}
+#[async_trait]
+impl GroupUpdateReceiverPort for ObservedGroupUpdateReceive {
+    async fn receive(
+        &self,
+        connection: ConnectionLease,
+    ) -> Result<GroupUpdateReceiveOutcome, anyhow::Error> {
+        let started = Instant::now();
+        let span = operation_span(OperationContext {
+            domain: DiagnosticDomain::SpaceMembership,
+            operation: DiagnosticOperation::MembershipGroupUpdate,
+            role: DiagnosticRole::Member,
+            kind: DiagnosticSpanKind::Server,
+        });
+        let result = self.inner.receive(connection);
+        let result =
+            uc_observability_contract::diagnostics::scope_pending_inbound(span.clone(), result)
+                .await;
+        span.in_scope(|| {
+            let domain = DiagnosticDomain::SpaceMembership;
+            let operation = DiagnosticOperation::MembershipGroupUpdate;
+            let role = DiagnosticRole::Member;
+            let elapsed = started.elapsed();
+            let completion = match &result {
+                Ok(GroupUpdateReceiveOutcome::Applied) => {
+                    OperationCompletion::succeeded(domain, operation, role, elapsed)
+                }
+                Ok(GroupUpdateReceiveOutcome::Rejected(_)) => {
+                    OperationCompletion::rejected(domain, operation, role, elapsed)
+                }
+                Ok(GroupUpdateReceiveOutcome::Unavailable(_)) => OperationCompletion::failed(
+                    domain,
+                    operation,
+                    role,
+                    DiagnosticErrorType::Unavailable,
+                    elapsed,
+                ),
+                Err(source) => OperationCompletion::failed(
+                    domain,
+                    operation,
+                    role,
+                    match source
+                        .downcast_ref::<KeyEpochError>()
+                        .map(group_update_failure_detail)
+                    {
+                        Some(detail) => match detail.phase {
+                            GroupUpdatePhase::LoadState | GroupUpdatePhase::PersistState => {
+                                DiagnosticErrorType::Storage
+                            }
+                            GroupUpdatePhase::InstallSecurityState => DiagnosticErrorType::Security,
+                            _ => DiagnosticErrorType::Internal,
+                        },
+                        None => DiagnosticErrorType::StreamFailed,
+                    },
+                    elapsed,
+                ),
+            };
+            let failure = match &result {
+                Ok(
+                    GroupUpdateReceiveOutcome::Unavailable(source)
+                    | GroupUpdateReceiveOutcome::Rejected(source),
+                ) => Some(source),
+                Err(source) => source.downcast_ref::<KeyEpochError>(),
+                _ => None,
+            };
+            if let Some(source) = failure {
+                complete_group_update_failure(group_update_failure_detail(source), completion);
+            } else {
+                complete_operation(completion);
+            }
+        });
+        result
+    }
+}
 use uc_core::membership::{
-    GroupUpdateDispatchError, GroupUpdateDispatchPort, MembershipHistoryExchangeError,
-    MembershipHistoryExchangePort, MembershipHistoryMessage, PendingGroupUpdate,
+    GroupUpdateDispatchError, GroupUpdateDispatchPort, MembershipHistoryExchangeEndpointPort,
+    MembershipHistoryExchangeError, MembershipHistoryExchangePort, MembershipHistoryMessage,
+    PendingGroupUpdate,
 };
 use uc_observability_contract::diagnostics::connectivity::{
     complete_membership_history_failure, MembershipHistoryFailureDetail,
@@ -39,8 +128,20 @@ impl MembershipOperation {
     }
 }
 
-pub(crate) fn observe_membership(adapters: SpaceMembershipAdapters) -> SpaceMembershipAdapters {
-    SpaceMembershipAdapters {
+pub(crate) fn observe_membership(
+    adapters: SpaceMembershipAdapters,
+    receiver: Arc<dyn GroupUpdateReceiverPort>,
+) -> (
+    SpaceMembershipAdapters,
+    Arc<dyn GroupUpdateReceiverPort>,
+    Box<
+        dyn FnOnce(
+                Arc<dyn MembershipHistoryExchangeEndpointPort>,
+            ) -> Arc<dyn MembershipHistoryExchangeEndpointPort>
+            + Send,
+    >,
+) {
+    let adapters = SpaceMembershipAdapters {
         membership_history_transport: Arc::new(ObservedMembershipHistoryExchange {
             inner: adapters.membership_history_transport,
         }),
@@ -51,7 +152,12 @@ pub(crate) fn observe_membership(adapters: SpaceMembershipAdapters) -> SpaceMemb
             inner: adapters.group_update_dispatch,
         }),
         ..adapters
-    }
+    };
+    (
+        adapters,
+        observe_group_update_receive(receiver),
+        Box::new(observe_history_endpoint),
+    )
 }
 
 fn membership_span(operation: MembershipOperation) -> tracing::Span {
@@ -214,7 +320,7 @@ impl RestrictedMembershipDeliveryPort for ObservedRestrictedMembershipDelivery {
                     MembershipOperation::RestrictedDelivery,
                     started.elapsed(),
                     result.as_ref().copied().map_err(|error| match error {
-                        RestrictedMembershipDeliveryError::Deferred => {
+                        RestrictedMembershipDeliveryError::Deferred { .. } => {
                             MembershipCompletionKind::Deferred
                         }
                         RestrictedMembershipDeliveryError::Rejected => {
@@ -255,7 +361,10 @@ impl GroupUpdateDispatchPort for ObservedGroupUpdateDispatch {
                         GroupUpdateDispatchError::Offline { .. } => {
                             MembershipCompletionKind::Failed(DiagnosticErrorType::Unavailable)
                         }
-                        GroupUpdateDispatchError::Rejected => MembershipCompletionKind::Rejected,
+                        GroupUpdateDispatchError::Rejected(_) => MembershipCompletionKind::Rejected,
+                        GroupUpdateDispatchError::ReceiverUnavailable => {
+                            MembershipCompletionKind::Failed(DiagnosticErrorType::Unavailable)
+                        }
                         GroupUpdateDispatchError::Transport { .. } => {
                             MembershipCompletionKind::Failed(DiagnosticErrorType::StreamFailed)
                         }
@@ -300,5 +409,51 @@ mod tests {
         ));
 
         assert_eq!(detail.local_fields(), ("exchange_history", "transport"));
+    }
+}
+
+fn observe_history_endpoint(
+    inner: Arc<dyn MembershipHistoryExchangeEndpointPort>,
+) -> Arc<dyn MembershipHistoryExchangeEndpointPort> {
+    Arc::new(ObservedHistoryEndpoint { inner })
+}
+struct ObservedHistoryEndpoint {
+    inner: Arc<dyn MembershipHistoryExchangeEndpointPort>,
+}
+#[async_trait]
+impl MembershipHistoryExchangeEndpointPort for ObservedHistoryEndpoint {
+    async fn handle_membership_history_exchange(
+        &self,
+        source: &DeviceId,
+        message: MembershipHistoryMessage,
+    ) -> Result<MembershipHistoryMessage, MembershipHistoryExchangeError> {
+        let started = Instant::now();
+        let span = operation_span(OperationContext {
+            domain: DiagnosticDomain::SpaceMembership,
+            operation: DiagnosticOperation::MembershipHistorySync,
+            role: DiagnosticRole::Member,
+            kind: DiagnosticSpanKind::Server,
+        });
+        let result = self
+            .inner
+            .handle_membership_history_exchange(source, message)
+            .instrument(span.clone())
+            .await;
+        span.in_scope(|| {
+            let completion = membership_completion(
+                MembershipOperation::HistoryExchange,
+                started.elapsed(),
+                result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(history_exchange_completion),
+            );
+            if let Err(source) = &result {
+                complete_membership_history_failure(history_failure_detail(source), completion);
+            } else {
+                complete_operation(completion);
+            }
+        });
+        result
     }
 }

@@ -150,11 +150,9 @@ pub(crate) fn settings_section(section: SettingsSectionSummary) -> &'static str 
         SettingsSectionSummary::RetentionPolicy => "retention_policy",
         SettingsSectionSummary::Security => "security",
         SettingsSectionSummary::Pairing => "pairing",
-        SettingsSectionSummary::KeyboardShortcuts => "keyboard_shortcuts",
         SettingsSectionSummary::FileSync => "file_sync",
         SettingsSectionSummary::Network => "network",
         SettingsSectionSummary::MobileSync => "mobile_sync",
-        SettingsSectionSummary::QuickPanel => "quick_panel",
     }
 }
 

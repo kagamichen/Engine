@@ -15,7 +15,9 @@ use uc_application::deps::{
     ClearProfileStatePort, CurrentMemberSignaturePort, ProfileLifecycleRepositoryPort,
     RetireUpgradeBackupSecurityRecordsPort, WipeProfileKeysPort,
 };
+use uc_core::app_dirs::HostConfigurationFileError;
 use uc_core::clipboard::ActiveClipboardState;
+use uc_core::diagnostics::HostLogProfileError;
 use uc_core::ports::blob::BlobReferenceRepositoryPort;
 use uc_observability_contract::analytics::AnalyticsFacade;
 
@@ -46,7 +48,7 @@ pub enum WiringError {
     #[error("profile storage upgrade failed")]
     StorageUpgrade {
         #[source]
-        source: uc_infra::security::ProfileStorageUpgradeError,
+        source: uc_infra_profile::security::ProfileStorageUpgradeError,
     },
 
     #[error("profile storage upgrade prerequisite failed")]
@@ -54,6 +56,12 @@ pub enum WiringError {
         #[source]
         source: anyhow::Error,
     },
+
+    #[error("host configuration file declaration is invalid")]
+    HostConfigurationFiles(#[source] HostConfigurationFileError),
+
+    #[error("host log profile declaration is invalid")]
+    HostLogProfile(#[source] HostLogProfileError),
 
     #[error("unfinished passphrase change could not be recovered")]
     PassphraseChangeRecovery {
@@ -94,30 +102,32 @@ pub struct SyncEngineDeps {
     /// Independent member signatures from the current OpenMLS member tree.
     pub current_member_signatures: Arc<dyn CurrentMemberSignaturePort>,
     /// The same unlocked session used by space access and encrypted storage.
-    pub membership_session: Arc<uc_infra::space::InMemorySession>,
+    pub membership_session: Arc<uc_infra_profile::space::InMemorySession>,
     /// 完整后台安全生命周期；关闭时封口，普通 GUI 授权不影响它。
-    pub security_lifecycle: Arc<uc_infra::space::RuntimeSpaceAccessAdapter>,
+    pub security_lifecycle: Arc<uc_infra_profile::space::RuntimeSpaceAccessAdapter>,
+    /// 暂停时交还的全部本地资源：安全会话、内容密钥租约与运行期数据库连接。
+    pub local_resources: Arc<uc_infra_profile::space::ProfileLocalResources>,
     /// MasterKey-encrypted single membership record, committed together with its read model.
     pub membership_ledger: Arc<
-        uc_infra::space::SqliteMembershipRecordStore<
-            Arc<uc_infra::db::executor::DieselSqliteExecutor>,
+        uc_infra_profile::space::SqliteMembershipRecordStore<
+            Arc<uc_infra_storage::db::executor::DieselSqliteExecutor>,
         >,
     >,
     /// MasterKey-encrypted aggregate repository shared by all admission roles.
     pub admission_state: Arc<
-        uc_infra::space::SqliteSpaceAdmissionState<
-            Arc<uc_infra::db::executor::DieselSqliteExecutor>,
+        uc_infra_profile::space::SqliteSpaceAdmissionState<
+            Arc<uc_infra_storage::db::executor::DieselSqliteExecutor>,
         >,
     >,
     /// Space-generation-bound OPAQUE setup and registration lifecycle.
     pub admission_credentials: Arc<
-        uc_infra::space::SqliteSpaceAdmissionCredentials<
-            Arc<uc_infra::db::executor::DieselSqliteExecutor>,
+        uc_infra_profile::space::SqliteSpaceAdmissionCredentials<
+            Arc<uc_infra_storage::db::executor::DieselSqliteExecutor>,
         >,
     >,
     pub encryption_passphrase_change: Arc<
-        uc_infra::space::EncryptionPassphraseChange<
-            Arc<uc_infra::db::executor::DieselSqliteExecutor>,
+        uc_infra_profile::space::EncryptionPassphraseChange<
+            Arc<uc_infra_storage::db::executor::DieselSqliteExecutor>,
         >,
     >,
     pub admission_space_transition: Arc<dyn uc_application::deps::AdmissionSpaceTransitionPort>,
@@ -125,7 +135,7 @@ pub struct SyncEngineDeps {
     pub membership_branch_transition_executor:
         Arc<dyn uc_application::deps::AdvanceMembershipBranchTransitionPort>,
     pub active_generation_manifest_store:
-        Arc<uc_infra::security::ActiveSpaceGenerationManifestStore>,
+        Arc<uc_infra_profile::security::ActiveSpaceGenerationManifestStore>,
     pub device_management_reset_data: Arc<dyn uc_application::deps::DeviceManagementResetDataPort>,
     /// plaintext-hash → ciphertext-digest dedupe cache (Slice 3 Phase 1).
     pub blob_reference_repo: Arc<dyn BlobReferenceRepositoryPort>,
@@ -146,7 +156,7 @@ pub struct DaemonRuntimeDeps {
     /// (facade read side), sharing one allocation — daemon writes, facade reads
     /// (ports.md §8.3 single-adapter-reuse).
     pub mobile_sync_endpoint_info:
-        Arc<uc_infra::mobile_sync::InMemoryMobileSyncEndpointInfoAdapter>,
+        Arc<uc_mobile_lan::mobile_sync::InMemoryMobileSyncEndpointInfoAdapter>,
 }
 
 /// LAN compatibility 组合根所需的 Application 被动端口。

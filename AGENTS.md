@@ -18,9 +18,11 @@
 
 ## 不可破坏的规则
 
-- **持久化默认密文**：写入 SQLite、磁盘缓存或搜索索引的业务负载默认先经 MasterKey AEAD 加密，严禁明文落库。
+- **用户内容持久化必须密文**：用户内容（来自剪贴板或经同步收到的内容及其派生数据，包括剪贴板文件的文件名和路径）写入 SQLite、磁盘缓存、搜索索引或配置文件前必须先经 MasterKey AEAD 加密，严禁明文落库；例外仅限下文已批准的文件内容本体和受管缓存 basename。
+- 凭据和密钥材料（MasterKey、passphrase、KEK、relay 访问令牌、鉴权令牌等）只能保存在系统安全存储中，不得写入配置文件、日志或其他普通文件；Engine 内已有兼容例外仅限「运行期密钥材料」的 `vault/profile-secrets-v1`，不得扩大，宿主侧的已有例外由宿主仓库规定。
+- 配置（用户或程序的偏好与参数，如本机设备名、保存目录、relay 地址、局域网地址）可以明文保存，无需逐项审批；配置不得包含用户内容或凭据，日志与观测规则不变。
 - 仅内容类型枚举、文件内容本体，以及入站文件在受管缓存中经安全清理且只作实际 basename 的原始文件名可明文保存；原始路径、数据库/搜索字段、日志与关联元数据仍须加密或脱敏。
-- 新持久字段或文件默认敏感；主张明文例外必须在 PR 说明并取得明确批准。
+- 除配置外，新持久字段或文件默认敏感；主张明文例外必须在 PR 说明并取得明确批准。
 - 日志、公开错误和观测事件不得包含剪贴板内容、密码、密钥、完整令牌、邀请、设备名、地址、文件名或路径。
 - 核心问题只在本仓修复，产品仓不维护补丁副本。
 - `uc-engine` 是唯一稳定 Rust 入口；iOS、Android、HarmonyOS 绑定只依赖它并使用同一版本。
@@ -47,7 +49,7 @@
 - 保持单一事实来源，不长期保留新旧两套实现或文档入口。
 - 文档中的仓库路径使用相对路径。
 - 使用 planning-with-files 时，`task_plan.md`、`findings.md`、`progress.md` 统一存放在 `.planning/<YYYY-MM-DD>-<任务短名>/` 下，不得创建在仓库根目录；继续已有任务时复用其原目录。
-- Rust 命令从仓库根目录运行。
+- Rust 命令从仓库根目录运行，统一通过 `just cargo`；直接运行 Cargo 前 source `scripts/build-cache/env.sh`。
 - Cargo 构建默认复用仓库 `target`；该路径不可用时先停止并修复，不得把任务命名的 `CARGO_TARGET_DIR` 改到 `/tmp` 或 `/private/tmp` 继续构建。
 - 多 Agent 可以并行读代码和修改互不重叠的文件，但 Cargo 验证由一个负责人通过共享 `target` 串行执行；不得让每个 Agent 各建一套完整构建目录。
 - 默认保留环境中的共享编译缓存；除非任务就是诊断缓存本身，不得通过清空 `RUSTC_WRAPPER` 绕过它。
@@ -70,9 +72,9 @@
 不涉及行为改动时至少运行：
 
 ```bash
-cargo metadata --locked --format-version 1
-cargo check --workspace --all-targets --locked
-cargo fmt --all -- --check
+just cargo metadata --locked --format-version 1
+just cargo check --workspace --all-targets --locked
+just cargo fmt --all -- --check
 node scripts/architecture/check-rust-style.mjs
 node scripts/architecture/check-engine-repository.mjs
 git diff --check

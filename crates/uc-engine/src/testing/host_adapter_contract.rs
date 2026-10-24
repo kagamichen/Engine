@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 
+#[cfg(feature = "dev-tools")]
+mod active_pull_cancellation;
+#[cfg(all(feature = "dev-tools", target_os = "linux"))]
+mod blob_resources;
 mod profile_upgrade_backup;
+#[cfg(feature = "dev-tools")]
+mod receive_retry;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -352,7 +358,7 @@ impl Respond for ResolveEnginePairingTicket {
 }
 
 #[cfg(feature = "dev-tools")]
-async fn mount_engine_rendezvous(server: &MockServer) {
+pub(crate) async fn mount_engine_rendezvous(server: &MockServer) {
     const INVITATION_CODE: &str = "E2E0-A001";
     const EXPIRES_AT_MS: i64 = 1_900_000_000_000;
 
@@ -1147,6 +1153,9 @@ async fn reset_space_rebuilds_device_management_state_and_preserves_local_histor
     let temp = tempfile::tempdir().unwrap();
     let secure_storage = MemoryHostSecureStorage::default();
     let config = EngineConfig::new("1.2.3");
+    // 本例验本地资料和生命周期，使用现有测试开关避免公网中转重连影响完成时刻。
+    #[cfg(feature = "dev-tools")]
+    let config = config.with_test_relay_fallback(false);
     let (engine, _events) = Engine::start(
         config.clone(),
         persistent_engine_host(temp.path(), secure_storage.clone()),
@@ -2760,40 +2769,16 @@ async fn engine_start_builds_a_resumable_real_session() {
             .unwrap(),
         crate::OperationResult::ConfigExport(crate::ConfigExportOutcome::NotInitialized,)
     );
-    assert!(matches!(
-        engine
-            .execute(crate::Operation::QueryDiagnostics)
-            .await
-            .unwrap(),
-        crate::OperationResult::DiagnosticsStatus(crate::DiagnosticsStatusSummary {
-            debug_mode: false,
-            restart_required: false,
-            ..
-        })
-    ));
     assert_eq!(
         engine
-            .execute(crate::Operation::UpdateDebugMode(
-                crate::UpdateDebugModeInput { enabled: true },
-            ))
-            .await
-            .unwrap(),
-        crate::OperationResult::DebugModeUpdated(crate::DebugModeUpdateSummary {
-            debug_mode: true,
-            restart_required: true,
-        })
-    );
-    assert!(matches!(
-        engine
             .execute(crate::Operation::QueryDiagnostics)
             .await
             .unwrap(),
         crate::OperationResult::DiagnosticsStatus(crate::DiagnosticsStatusSummary {
-            debug_mode: true,
-            restart_required: false,
-            ..
+            rejected_config_import: None,
+            effective_log_profile: None,
         })
-    ));
+    );
     assert!(matches!(
         engine
             .execute(crate::Operation::ExportDiagnosticLogs(
@@ -2913,6 +2898,7 @@ async fn engine_start_builds_a_resumable_real_session() {
         engine
             .execute(crate::Operation::StageConfigImport(
                 crate::StageConfigImportInput {
+                    replace_rejected_import: false,
                     source: HostFileHandle::new("config-bundle"),
                     password: crate::SecretString::new("correct horse"),
                 },
@@ -3930,9 +3916,9 @@ async fn engine_start_finishes_an_interrupted_factory_reset_before_opening_a_new
         crate::assembly::host::profile_key_recovery_store(&config, &paths, &recovery_host);
     assert_eq!(
         recovery_storage.prepare_startup().await.unwrap(),
-        uc_infra::security::ProfileRecoveryPreparation::Ready
+        uc_infra_profile::security::ProfileRecoveryPreparation::Ready
     );
-    let lifecycle = uc_infra::security::ProfileLifecycleRepository::new(recovery_storage);
+    let lifecycle = uc_infra_profile::security::ProfileLifecycleRepository::new(recovery_storage);
     let initial = uc_application::deps::ProfileLifecycleRepositoryPort::load(&lifecycle)
         .unwrap()
         .unwrap();
@@ -5048,7 +5034,7 @@ async fn production_engine_reuses_v019_file_network_identity() {
         assert!(
             secure_storage
                 .values()
-                .get(uc_infra::network::iroh::IDENTITY_STORE_KEY)
+                .get(uc_infra_p2p::network::iroh::IDENTITY_STORE_KEY)
                 .is_none(),
             "network identity leaked into primary secure storage on cycle {cycle}"
         );

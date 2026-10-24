@@ -16,7 +16,7 @@ crate 根只保留稳定名称的统一导出，内部按职责分为七层：
 | `assembly/` | 宿主适配、数据库、网络、加密、搜索、剪贴板和传输组装 |
 | `compatibility/mobile_lan/` | 与完整 P2P 主路径隔离的 LAN 兼容能力 |
 
-开发与验收操作单独位于 `dev/`，且只在显式启用 `dev-tools` feature 时编译；正式宿主和发布产物不得启用它。内部宿主契约检查位于 `testing/`。`runtime/mod.rs` 只拥有生产会话的建立、后台任务挂接和生命周期资源，具体路由、宿主剪贴板、文件操作与移动上传各自由独立内部模块拥有。`uc-infra` 具体类型只允许出现在 `assembly/`；业务操作和生产路由只能接收已经组装好的能力。完整导航见 `crates/uc-engine/README.md`。
+开发与验收操作单独位于 `dev/`，且只在显式启用 `dev-tools` feature 时编译；正式宿主和发布产物不得启用它。内部宿主契约检查位于 `testing/`。`runtime/mod.rs` 只拥有生产会话的建立、后台任务挂接和生命周期资源，具体路由、宿主剪贴板、文件操作与移动上传各自由独立内部模块拥有。`uc-infra-*` 具体类型只允许出现在 `assembly/`；业务操作和生产路由只能接收已经组装好的能力。完整导航见 `crates/uc-engine/README.md`。
 
 外部 crate 只能使用 crate 根导出的稳定名称和 `error_codes`，不得依赖内部模块路径或源码文件位置。
 
@@ -52,7 +52,7 @@ crate 根只保留稳定名称的统一导出，内部按职责分为七层：
 | `WorkspaceConvergenceChanged` | 仅 `dev-tools` 的内部收敛诊断事件；不进入正式宿主和发布产物 |
 | `NetworkRecoveryChanged` | 网络会话恢复开始、等待下一次尝试、成功或最终失败的稳定状态变化 |
 | `ProfileRecoveryChanged` | 资料密钥恢复状态发生变化；宿主仍可通过查询重新取得完整快照 |
-| `SettingsChanged { sections }` | 一次成功保存使持久化设置发生变化，只列出变化的分区（`general`、`sync`、`retention_policy`、`security`、`pairing`、`keyboard_shortcuts`、`file_sync`、`network`、`mobile_sync`、`quick_panel`），不携带设置值；宿主重新调用 `QuerySettings`。所有写入路径共享同一个通知出口，内容没有变化的保存和被拒绝的更新不产生事件 |
+| `SettingsChanged { sections }` | 一次成功保存使持久化设置发生变化，只列出变化的分区（`general`、`sync`、`retention_policy`、`security`、`pairing`、`file_sync`、`network`、`mobile_sync`），不携带设置值；宿主重新调用 `QuerySettings`。所有写入路径共享同一个通知出口，内容没有变化的保存和被拒绝的更新不产生事件。Engine 设置只含 Engine 拥有的节点行为与本机设备名；宿主产品外壳偏好（启动方式、自动启动、更新、主题、语言、产品分析许可、快捷键、快捷面板）由宿主产品自行保存，不在设置契约和本事件中。旧 `settings.json` 中残留的这些键在加载时被忽略，即使取值非法也不影响启动，下一次保存时不再写出 |
 | `RePairingRequired { scope }` | 旧资料独立化完成，需要产品提示重新配对；`all_devices` 表示全部旧设备关系均须重新建立 |
 | `RefreshRequired` | 宿主必须重新查询当前状态 |
 | `OperationFinished` | 一次操作进入成功、失败或取消终态 |
@@ -103,8 +103,10 @@ Running|Quiescing|Quiesced|Suspended -> ShuttingDown -> Stopped
 ```
 
 - `quiesce(deadline)`：停止接收新操作，并等待正在执行的操作结束。期限到达后取消剩余操作。
-- `suspend()`：先停止接收操作，等待已取消调用实际退出，再释放节点、会话级后台任务、连接与 profile 安全租约；同时暂停进程级 Clipboard 磁盘工作，清除安全缓存并禁止后台重建。旧操作仍未退出时返回失败，不发布暂停成功。事件流与核心实例保持不变。
-- `resume()`：先重新取得 profile 安全租约，再使用原持久数据和原设备身份重建节点与后台任务；文件仍被其他使用者占用时保持暂停，允许之后重试。不会自动重试暂停前被取消的操作。
+- `suspend()`：先停止接收操作，等待已取消调用实际退出，再释放节点、会话级后台任务、连接与 profile 安全租约，随后关闭 profile 与 control 数据库的全部 SQLite 连接（仍被借出的连接归还前不关闭、不报告成功）；同时暂停进程级 Clipboard 磁盘工作，清除安全缓存并禁止后台重建。若这是进程内最后一个工作中的 Engine，还在发布前让进程网络日志停车（关闭分段、交还 `lease.lock`）。旧操作仍未退出时返回失败，不发布暂停成功。事件流与核心实例保持不变。
+- 暂停成功（状态读到 `Suspended`）的含义：本进程不再持有 Engine 自有的文件锁或 SQLite 连接，包括数据库主文件、WAL 与共享内存、内容密钥租约、iroh blob 存储和网络日志运行租约。发布前 Engine 在模块日志写一条核对记录，只含宿主目录内仍打开的数据库文件数 `open_database_files` 与租约文件数 `open_lease_files`（预期为 0；不为 0 时为 WARN；无法枚举描述符的平台不写计数）。宿主自有的文件不在此列，例如移动端的运行期所有权锁与宿主自己打开的数据库，由宿主负责。
+- 期限：带期限的暂停只结束宿主等待；已接受的暂停在在途工作退出后继续完成上述交接并发布 `Suspended`，宿主可查询状态确认，无需再次请求。启动后不久暂停时，节点关闭会等待 iroh 地址探测连接排空，实测约 3–5 秒，期间上述文件仍被持有（见后台暂停安全计划）。
+- `resume()`：先重新打开数据库连接与网络日志，再重新取得 profile 安全租约，使用原持久数据和原设备身份重建节点与后台任务；文件仍被其他使用者占用时保持暂停，允许之后重试。暂停期间其他进程对同一资料的写入在恢复后可读。不会自动重试暂停前被取消的操作。
 
 以上不构成平台总停止时间保证。子运行期的停止预算尚未统一，平台绑定等待超时也不等于底层收尾完成；
 完整移动后台安全验收见 [`后台暂停安全计划`](../exec-plans/active/2026-09-12-background-suspension.md)。
@@ -170,7 +172,7 @@ Running|Quiescing|Quiesced|Suspended -> ShuttingDown -> Stopped
 | `SearchEntries` | 使用关键词、时间、内容类型、来源设备和标签等条件查询加密搜索索引。`tag_match` 取 `any`（默认，命中任一标签）或 `all`（必须同时携带所有标签）；其他维度组内取“或”，维度之间取“且” |
 | `CountSearchEntries` | 批量统计匹配数：每个查询与 `SearchEntries` 走同一套解析与索引路径，`total` 逐项一致，`limit`、`offset` 被忽略；单次最多 32 个查询，按输入顺序返回。加密会话未就绪时返回搜索会话锁定错误，索引重建中返回重建错误，不降级为近似值 |
 | `QueryDailyEntryCounts` | 按调用方给出的严格递增绝对时间戳边界统计条目数，第 `i` 个桶为 `[b[i], b[i+1])`，最多 400 个桶。Engine 不含时区与夏令时规则，日边界由宿主按用户本地时区计算。会话锁定失败关闭，规则与 `CountSearchEntries` 相同 |
-| `QuerySearchTags` | 查询当前索引中的标签和条目数量 |
+| `QuerySearchTags` | 查询当前索引中的标签和条目数量；本机历史标签以 `is_builtin = false` 出现，只统计已建索引的条目；会话锁定或索引重建中不返回本机历史标签 |
 | `QuerySearchStatus` | 查询索引是否可用及最近重建时间 |
 | `RebuildSearchIndex` | 请求重建当前加密搜索索引 |
 | `SendText` | 写入加密历史、更新搜索并发送不超过 64 KiB 的文本 |
@@ -180,6 +182,14 @@ Running|Quiescing|Quiesced|Suspended -> ShuttingDown -> Stopped
 | `GetHistoryEntry` | 返回指定文本记录的完整详情 |
 | `DeleteHistoryEntry` | 删除指定记录及其关联选择、文件、搜索和 blob 引用 |
 | `SetHistoryEntryFavorite` | 设置指定记录的收藏状态 |
+| `ListHistoryTags` | 列出本机历史标签及各自关联的条目数，按条目数降序、名称、id 排序；名称无法解密的标签以空名称返回，仍可删除 |
+| `CreateHistoryTag` | 按名称创建本机历史标签；规范化后同名（忽略大小写）时返回已有标签和 `created = false` |
+| `RenameHistoryTag` | 修改标签名称；与另一个标签同名时不写入并返回 `NameConflict { existing_tag_id }`；名称密文无法打开的标签不能改名（1404），只能删除 |
+| `AddHistoryTagToEntries` | 把一个标签关联到 1 到 1000 条记录；存在的记录在一个事务内生效，不存在的记录跳过并返回 |
+| `RemoveHistoryTagFromEntries` | 从 1 到 1000 条记录移除一个标签，规则与关联相同 |
+| `SummarizeHistoryEntryTags` | 返回一组记录中仍存在的数量，以及每个标签在其中的携带数量 |
+| `MergeHistoryTags` | 把 1 到 100 个来源标签的关联并入目标标签并去重，随后删除来源标签；记录内容不变 |
+| `DeleteHistoryTag` | 删除标签及其关联，返回解除的关联数；记录内容不变 |
 | `QueryHistoryStats` | 返回历史记录总数和总大小 |
 | `GetHistoryEntryResource` | 返回指定记录的资源标识、类型、大小及可用读取方式 |
 | `ReadBlob` | 读取指定 blob 的完整字节和媒体类型 |
@@ -299,6 +309,16 @@ device id 与 display name，但这些字段不得进入日志或调试输出。
 “设备组尚未确认一致”，不能按正常关系展示；有效确认到达后自动恢复为 `consistent`。离线、超时、重启或
 失去通信路径都不能自行清除该状态，它也不等同于已经取得两份不可比较历史的 `diverged`。
 
+每个设备关系的可选 `group_update` 给出本机对该设备尚未确认的队首组密钥更新：`epoch`、`state`
+（`waiting`、`receiver_unavailable`、`rejected_unclassified`、`rejected_by_receiver`）、`attempts`，以及仅在
+`recovery=automatic` 时出现的 `next_retry_at_ms`。`recovery` 表示 Engine 自己是否会推进：`automatic` 按退避自动重试；
+`automatic_on_reconnect` 在该设备重新通过认证后自动重新评估一次（有频率上限，成功应用才清除）；`review_device`
+不会自动重发，需要核对该设备。缺省表示本机对它没有未确认的更新，该事实与成员保护状态（`QuerySpaceProtection`
+的 MLS 成员关系）相互独立，宿主不得把“受保护”读成“已确认收到最新 epoch”。`automatic` 和 `automatic_on_reconnect`
+时宿主的“重新检查”不会改变结果，不应提供；字段缺省或为旧值的宿主按原 `space_device_update` 展示。
+整体状态 `space_device_update` 的取值不变：任何设备的拒绝（含原因未知的旧拒绝）仍使整体进入
+`needs_attention/device_security_update_rejected`，原因与设备由 `group_update` 说明。
+
 产品调用 `ChooseDeviceGroup` 时必须原样回传同一次查询中的 `issue_id`、`choice_id` 和 `expected_revision`。
 结果明确区分完成、仍在等待、需要重新配对、已经完成、状态已变化和需要确认移除本机；状态已变化时重新
 查询，不得用旧选择覆盖新事实。本机将被移除时，只有在产品取得用户明确确认后才传入
@@ -342,6 +362,8 @@ HarmonyOS 绑定必须公开相同字段、结果、错误和提醒。
 `ListHistoryEntries` 是旧桌面列表接口迁移期间使用的完整投影，每次必须请求 1 到 1000 条，并保留预览、收藏、标签、链接、文件大小、图片尺寸和内容可用状态。它不替代带稳定分页标记的 `QueryHistory`，新宿主仍应优先使用搜索或 `QueryHistory`。列表、详情和资源结果可以正常携带用户内容，但调试输出不得包含预览、正文、链接、缩略图地址或内联字节。
 
 `GetHistoryEntry` 只适用于可读取为文本的记录；记录不存在返回 `NotFound`，内容不支持文本详情返回 `Conflict`。`SetHistoryEntryFavorite` 对不存在记录同样返回 `NotFound`，不能把未修改任何记录当作成功。
+
+本机历史标签是每台设备自己的历史元数据，不进入任何同步载荷，也不随配对传播。标签 id 是与名称无关的不透明 id，内置标签 id 保持不变并以 `is_builtin` 区分；用户手动关联不是规则标签。名称规则为：去掉首尾空白后转为 NFC，不能为空、不能含控制字符、最多 64 个 Unicode 标量；同名判断忽略大小写，展示保留用户输入；单个 profile 最多 1000 个标签。所有标签操作在加密会话锁定时返回 1405，旧格式 profile 返回 1406；未知标签返回 `NotFound`，合并的来源与目标相同返回输入错误，重复合并或删除因来源已不存在返回 `NotFound`。标签名称、创建时间与记录关联只以 MasterKey AEAD 密文保存；搜索索引中的用户标签成员只以搜索密钥 HMAC 后的词项保存，由权威关联派生，因此索引重建会恢复用户标签过滤。搜索结果的 `tags` 中的用户标签 id 由权威关联补齐；会话锁定时 `QuerySearchTags` 不返回用户标签。删除记录时其关联随之删除。调试输出与日志不包含名称。
 
 `DeleteHistoryEntry` 和 `ClearHistory` 由核心统一清理数据库记录、选择、缓存文件、搜索索引和 blob 引用，宿主不得自行复制清理顺序。批量清空发生部分失败时只返回失败条目标识，不返回底层异常、文件路径或用户内容。
 
@@ -401,3 +423,177 @@ HarmonyOS 绑定必须公开相同字段、结果、错误和提醒。
 ## 文件发送
 
 `SendFiles` 通过 `HostFileAccess` 从宿主文件句柄分块读取内容，并交给核心拥有的导入目录和 blob store。文件内容允许按原始字节落盘，以保持现有 P2P 文件格式；文件名、宿主路径和关联元数据仍不得明文持久化。
+
+
+## Host-declared configuration files
+
+The host declares additional configuration files with `EngineConfig::with_host_configuration_files`.
+Each `HostConfigurationFile` contains a basename and a `HostConfigurationFileReset` owner.
+The default declaration is empty. Engine does not parse product values or accept host-selected destination paths from a bundle.
+
+Names must match `[a-z0-9][a-z0-9._-]*`, end in `.json`, contain no `..`, and use at most 64 ASCII bytes.
+Names must contain one path component. Duplicate names fail validation, including duplicates with different reset owners.
+Engine rejects these reserved names: `settings.json`, `pending-import.json`, `upgrade-cursor.json`,
+`first-sync-state.json`, `daemon-run.json`, and `daemon-last-exit.json`.
+An invalid declaration stops `Engine::start` before profile I/O with code 1109 (`InvalidInput`, not retryable).
+Debug output contains the declaration count, not the filenames.
+
+### Export and import
+
+Export includes every declared regular file that exists under the data root.
+A missing file is optional. A symlink, directory, I/O failure, or file larger than 1 MiB fails export.
+The declaration must contain only configuration. Hosts must not declare credentials or user content as configuration.
+The existing encrypted bundle and credential policies remain unchanged.
+
+The archive member is `ui-state/<name>`. The historical prefix remains unchanged.
+Import restores that member to `<data_root>/<name>` only if the receiving host declares the same name.
+The archive and its manifest cannot select any other destination.
+Undeclared members do not create host files. A missing member preserves the existing destination file.
+Manifest schema 2 keeps the historical `ui-state/` member prefix. It requires the complete V3 runtime state.
+An incomplete schema-1 bundle is rejected before staging or target mutation. The result is
+`ConfigImportStageOutcome::Incompatible`, with a reason that requires re-export from the retained
+source installation. This compatibility policy was explicitly approved. Old readers reject archive schema 2. The pending marker also uses schema 2, so an old boot reader
+does not apply the new staging layout as a legacy single-store import.
+Do not reconstruct missing members, export independent keys, or copy platform credentials.
+
+The existing archive reader rejects absolute paths and parent traversal.
+The archive reader uses the last occurrence of a duplicate normalized member path, under the existing total size limit.
+Host declaration duplicates are rejected separately before I/O.
+Import writes each host file to a new temporary file, flushes it, then replaces the destination.
+A destination symlink is replaced; import does not write through the link.
+A destination directory fails import without removing that directory.
+Successful files can remain visible if a later copy fails. The import marker and staging remain for the next boot to retry.
+The boot owner clears the pending marker after all copies and runtime-layout installation succeed.
+It then removes staging. Each publication is flushed. The operation is not atomic across files.
+A failed adoption returns no running Engine handle. The next start resumes the same adoption.
+A retry copies the same staged bytes again. Hosts must not concurrently change files while boot applies an import.
+
+### Reset and upgrade backup
+
+`ByEngine` files follow the existing factory-reset journal after key wipe and Engine state cleanup.
+Engine removes files and unlinks symlinks. Engine refuses directories without recursively removing them.
+A failure preserves the reset phase for retry. Earlier file deletions can remain visible.
+`ByHost` files survive both failed and successful Engine reset.
+The daemon deletes the product file only after `FactoryResetSpace` succeeds and owns deletion retry and error visibility.
+The host must leave telemetry consent outside the reset declaration.
+
+Upgrade backup keeps its existing whole-root scope and exclusion list.
+Backup includes declared files, undeclared files, and telemetry when they exist in the root.
+The declaration does not narrow that scope.
+
+### Configuration import adoption
+
+The Application profile-startup owner invokes one complete offline adoption capability before version
+backup and before reading the lifecycle used for runtime wiring. The Infra import owner performs the
+following transaction while the host holds exclusive access to the profile:
+
+1. Bind a durable local journal to the staged marker and record which fixed Engine components exist.
+2. Move those components with no-replace renames into a private sibling recovery directory.
+3. Capture and verify the retired state with `ProfileBackupArchive`. Retain its receipt and originals.
+4. Clear the recovery cache. Install the existing encrypted vault, content-key catalog, KEK and cursor.
+5. Authenticate the source V3 manifest with the imported lifecycle and admission key. Use
+   `ProfileRuntimeLayout` to install both database snapshots and encrypted blobs at its generation paths.
+6. Mark installation durable. Clear the pending marker, remove staging, then clear the local journal.
+7. Load the imported lifecycle for runtime wiring. Never reuse the target lifecycle or upgrade journal.
+
+Export keeps independent profile and control snapshots. It checks both persistent database revisions
+and protected files before sealing. A concurrent source change causes at most three attempts. Other
+errors fail immediately. The outer bundle AEAD, KDF, limits and current-profile KEK contract do not change.
+The existing encrypted profile vault carries independent runtime secrets. `secrets.json` does not gain keys.
+
+The retirement list is fixed in Engine code. Neither the archive nor host declarations select it.
+Unknown root files and telemetry remain in place. Optional absent settings remain in place. Declared
+host files use their existing overwrite and missing-member rules. Retired Engine directories include
+unknown children without deleting them. Existing target upgrade backups stay with the old encrypted
+vault in the retained recovery transaction. Imported keys do not reinterpret their security records.
+
+Recovery data lives at the profile parent's `.uc-config-import-recovery/<root-digest>/<transaction>/`.
+`originals/`, `archive/` and `receipt.json` remain after success. This transaction does not prune them.
+To restore, use the verified archive to create a new isolated profile. Restore retained upgrade backups
+to the host-selected backup directory and spool data to the host-selected spool directory separately.
+Use the original target passphrase through public `UnlockSpace`; never copy secure-storage identities.
+No-replace retirement requires the state and recovery directory to share a filesystem. A cross-device
+move fails with originals retained. Do not substitute an unverified copy-and-delete operation.
+
+Historical 1101 and 1103 failures remain repro evidence. Successful acceptance requires public Engine
+starts on fresh and existing targets, first and subsequent starts, source Space identity, ready encryption,
+copy-failure replay, retained target bytes and recovery of the old target with its original passphrase.
+The original incomplete legacy bundle is accepted only as an explicit rejection with target state unchanged.
+
+Unsupported or incomplete pending imports left by an older Engine are rejected before adoption starts.
+Engine retains the original `pending-import.json` and the entire `import-staging/` tree byte for byte.
+It does not delete, relocate, copy or rewrite rejected materials. These existing persisted inputs are
+also the persistent rejection state. No additional credential file, journal format, backup series or
+plaintext status file is introduced. Ordinary startup continues with the original profile. Rejected
+staging does not bypass original-profile key recovery. An existing adoption journal or an inspection
+I/O failure still follows the recovery/failure path; it must not be treated as a safe rejection.
+
+`QueryDiagnostics` returns `rejected_config_import: Option<RejectedConfigImportSummary>`, including a
+safe `reason` (`unsupported_format`, `malformed_marker`, or `missing_runtime_members`) and the fixed
+message `Import was not completed. Re-export the configuration bundle using the new version.` Hosts
+must display the rejection and localized re-export guidance after startup, including subsequent starts.
+The status is read from persisted inputs on each query; it is not a once-only event or log message.
+No source path, member name, profile identity or secret is included. `None` means there is no rejected
+pending input; it does not certify a successful import. Stage success still means pending, not applied.
+
+Mobile hosts use the formal UniFFI method `MobileEngine.query_rejected_config_import()`.
+It returns `Result<Option<RejectedConfigImport>, BindingError>` by executing the real Engine
+`QueryDiagnostics` operation. The record contains the typed `ConfigImportRejectionReason` and the
+same fixed message. It does not read private files or use the process-observability status query.
+Engine query errors retain `BindingError::Engine { code, category, retryable }`; they are never
+converted to `None`. Hosts query after startup and successful session recovery/resume, show a
+separate status-read failure when the query fails, and localize by reason rather than parsing message.
+Use Swift/Kotlin generated from the matching UniFFI library; regeneration is part of this interface change.
+No Mobile write or configuration-import operation is added. Product UI remains host-owned.
+
+The single pending slot remains bounded and retained until an explicit action replaces or removes it.
+`StageConfigImportInput.replace_rejected_import` must be `false` unless the host has obtained explicit
+confirmation to irreversibly replace the retained rejected materials. With `false`, a new Stage returns
+`Incompatible` and preserves all old bytes. With `true`, the new bundle and password must first pass
+complete validation; only then may the maintained staging writer replace the old slot. Failed validation
+never releases old materials. Confirmation must explain that the retained data may be the only source
+and that replacement is irreversible. An explicitly requested whole-profile FactoryReset also deletes
+this slot under its existing deletion contract. Ordinary startup, diagnostic queries and export do not.
+There is no automatic pruning, unbounded rejection archive, or hidden credential-copy recovery path.
+
+Only fixed Engine-owned paths are inspected. Marker-supplied destinations cannot select filesystem
+paths. Inspection rejects marker, staging-tree or member symlinks and nonregular objects with a storage
+failure; it does not follow them or convert an I/O fault into permission to continue or replace data.
+The host must supply an exclusively owned profile root. Adversarial replacement of ancestor directories
+outside that root is outside the exclusive-profile contract.
+
+Export checks the cumulative tar size, including headers, padding and the AEAD size allowance, before
+reading blob contents. Oversized exports fail without replacing the destination. Capture and revision
+verification run in one blocking task with the caller's tracing span. Both database snapshots and blobs
+stream into the bounded tar. Scratch snapshots are cleaned on success and failure.
+
+## Host-declared log profile
+
+Engine owns no log-verbosity preference. The host owns the process log profile and applies it
+before it starts Engine. The host reports the profile it installed with `EngineConfig::with_host_log_profile`.
+The default is no declaration.
+
+The label must be 1–32 bytes of `[a-z0-9_-]`. Engine does not interpret the label or keep a list of
+host names. An invalid label stops `Engine::start` before profile I/O with code 1110 (`InvalidInput`,
+not retryable). The label is not persisted and is not part of a configuration bundle. Each start reports
+only its own declaration. The host owns any restart that applies a changed preference.
+
+`QueryDiagnostics` returns `DiagnosticsStatusSummary { effective_log_profile: Option<String> }`.
+The diagnostic export manifest carries the same value as `effectiveLogProfile`, or `null` when
+the host declared nothing. One value feeds both. Engine does not read `RUST_LOG`, `UC_LOG_PROFILE`,
+`settings.json` or its own build type to guess a profile. Diagnostic export no longer loads settings.
+
+The declaration changes no Engine logging. Module logs follow the standard and detailed capture
+modes of the process observability runtime. The network-library log rules, budgets and capture
+windows are unchanged. No profile label starts a detailed capture.
+
+Removed from the Engine contract: `Operation::UpdateDebugMode`, `OperationKind::UpdateDebugMode`,
+`UpdateDebugModeInput`, `DebugModeUpdateSummary`, `OperationResult::DebugModeUpdated`,
+`DiagnosticsStatusSummary.debug_mode`, `DiagnosticsStatusSummary.restart_required`,
+`GeneralSettingsSummary.debug_mode`, `GeneralSettingsPatch.debug_mode`, and the manifest key `debugMode`.
+Error code 1412 is retired for the diagnostics group. It stays assigned to
+`RECEIVE_UNAVAILABLE_CODE` in the receive group. `QUERY_DIAGNOSTICS_FAILED_CODE` (1411) stays,
+because `QueryDiagnostics` still fails when the retained-import status cannot be read.
+
+A legacy `general.debug_mode` of any JSON type is ignored on load and not written on the next save.
+The settings schema version does not change.

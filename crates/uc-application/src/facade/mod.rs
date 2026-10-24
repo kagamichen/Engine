@@ -39,20 +39,21 @@ pub use crate::runtime_lifecycle::RuntimeLifecycle;
 pub use crate::space::{
     AdmissionReadFailureCategory, AdmissionRecoveryAction, AdmissionRecoveryStage,
     CancelSpaceJoinError, CurrentJoinStatus, DecideDeviceTrustChange, DecideDeviceTrustChangeError,
-    DecideDeviceTrustChangeResult, DeviceGroupChoiceImpact, DeviceTrustChangeChoice,
-    DeviceTrustDevice, DeviceTrustImpact, DeviceTrustMembership, DeviceTrustObservation,
-    DeviceTrustRelationship, DeviceTrustStatus, DeviceTrustSyncState, InboundPairing,
-    InboundPairingStatus, JoinSpaceAttentionReason, JoinSpaceAttentionRecovery, JoinSpaceError,
-    JoinSpaceInput, JoinSpaceResult, JoinSpaceTerminationReason, JoinedSpace,
-    LockSpaceSessionError, MembershipCommitReceipt, MembershipConflictStatus,
-    MembershipDiagnosticsView, MembershipReadiness, NetworkRecoveryEvent, NetworkRecoveryFacade,
-    NetworkRecoveryPhase, NetworkRecoveryRequestError, NetworkRecoveryStatus,
-    PairingConfirmationStatus, PendingDeviceTrustChange, PendingInboundMember,
-    QueryDeviceTrustError, QueryMembershipDiagnosticsError, QueryMembershipReadinessError,
-    QuerySpaceAccessStateError, RebuildNetworkSessionError, RebuildNetworkSessionPort,
-    RecoverSpaceSessionError, RecoverSpaceSessionResult, RemoveSpaceMemberError,
-    RemoveSpaceMemberResult, SpaceAccessState, SpaceDeviceUpdatePhase, SpaceDeviceUpdateProblem,
-    SpaceDeviceUpdateRecovery, SpaceDeviceUpdateStatus,
+    DecideDeviceTrustChangeResult, DeviceGroupChoiceImpact, DeviceGroupUpdate,
+    DeviceGroupUpdateRecovery, DeviceGroupUpdateState, DeviceTrustChangeChoice, DeviceTrustDevice,
+    DeviceTrustImpact, DeviceTrustMembership, DeviceTrustObservation, DeviceTrustRelationship,
+    DeviceTrustStatus, DeviceTrustSyncState, InboundPairing, InboundPairingStatus,
+    JoinSpaceAttentionReason, JoinSpaceAttentionRecovery, JoinSpaceError, JoinSpaceInput,
+    JoinSpaceResult, JoinSpaceTerminationReason, JoinedSpace, LockSpaceSessionError,
+    MembershipCommitReceipt, MembershipConflictStatus, MembershipDiagnosticsView,
+    MembershipReadiness, NetworkRecoveryEvent, NetworkRecoveryFacade, NetworkRecoveryPhase,
+    NetworkRecoveryRequestError, NetworkRecoveryStatus, PairingConfirmationStatus,
+    PendingDeviceTrustChange, PendingInboundMember, QueryDeviceTrustError,
+    QueryMembershipDiagnosticsError, QueryMembershipReadinessError, QuerySpaceAccessStateError,
+    RebuildNetworkSessionError, RebuildNetworkSessionPort, RecoverSpaceSessionError,
+    RecoverSpaceSessionResult, RemoveSpaceMemberError, RemoveSpaceMemberResult, SpaceAccessState,
+    SpaceDeviceUpdatePhase, SpaceDeviceUpdateProblem, SpaceDeviceUpdateRecovery,
+    SpaceDeviceUpdateStatus,
 };
 
 pub use crate::clipboard::active::{ActiveClipboardFacade, ActiveClipboardReconcileOutcome};
@@ -72,6 +73,7 @@ pub use clipboard::{
     CancelEntryReceiveError, CancelEntryReceiveOutcome, ClipboardSyncError, ClipboardSyncFacade,
     DispatchEntryInput, DispatchEntryOutcome, DispatchEntryPerTarget, EntryDeliveryStatusView,
     EntryDeliveryTargetView, EntryDeliveryView, EntrySource, GetEntryDeliveryViewError,
+    RetryEntryReceiveError, RetryEntryReceiveOutcome,
 };
 // V3 envelope codec helpers — surfaced through the facade per §11.4.3 so
 // external CLI / test consumers don't reach into `crate::usecases::*`
@@ -92,8 +94,8 @@ pub use crate::clipboard::outbound::{
     ResendEntryError, ResendReport, MAX_INLINE_OUTBOUND_REPRESENTATION_BYTES,
 };
 pub use crate::clipboard::sync::apply_inbound::{
-    ApplyInboundError, ApplyInboundInput, ApplyOutcome, FileCacheBlobMaterializer,
-    InboundBlobFetcher, InboundCapture, InboundSnapshotRebuild, InboundWrite,
+    ApplyInboundError, ApplyInboundInput, ApplyOutcome, InboundActivationOwner, InboundCapture,
+    InboundSnapshotRebuild, InboundWrite,
 };
 pub use crate::clipboard::sync::payload_codec::{self, encode_snapshot_to_v3_bytes};
 pub use crate::clipboard::sync::{
@@ -118,9 +120,7 @@ pub use clipboard_history::{
 };
 pub use clipboard_restore::{ClipboardRestoreError, ClipboardRestoreFacade};
 pub use config_migration::ConfigMigrationFacade;
-pub use diagnostics::{
-    DebugStatusView, DiagnosticsFacade, DiagnosticsFacadeError, LogExportView, UpdateDebugModeView,
-};
+pub use diagnostics::{DebugStatusView, DiagnosticsFacade, DiagnosticsFacadeError, LogExportView};
 pub use file_transfer::{
     BeginReceiverTransfer, FileTransferApplicationError, FileTransferFacade,
     ReceiverTransferHandle, ReceiverTransferRegistration,
@@ -157,8 +157,7 @@ pub use settings::{
     RelayProbeReport, RelayProbeReportView, RetentionPolicyPatch, RetentionPolicyView,
     RetentionRulePatchValue, RetentionRuleView, RuleEvaluationView, SecuritySettingsPatch,
     SecuritySettingsView, SettingsFacade, SettingsFacadeError, SettingsPatch, SettingsView,
-    ShortcutKeyView, SyncFrequencyView, SyncSettingsPatch, SyncSettingsView, ThemeView,
-    UpdateChannelView,
+    SyncFrequencyView, SyncSettingsPatch, SyncSettingsView,
 };
 
 pub use space_setup::{
@@ -176,3 +175,7 @@ pub use storage::{ClearCacheResultView, StorageFacade, StorageFacadeError, Stora
 pub use upgrade::{AcknowledgeUpgradeError, DetectUpgradeError, UpgradeFacade, UpgradeStatus};
 
 pub use crate::space::{ConnectivityOpportunity, PeerConnectionError};
+
+pub use crate::transfer::receive::materialization::{
+    FileCacheBlobMaterializer, InboundBlobFetcher,
+};

@@ -3,15 +3,18 @@
 #[cfg(target_os = "android")]
 mod android;
 mod local_diagnostics;
+mod network_log;
+pub use network_log::*;
 mod observability;
 pub use local_diagnostics::*;
 mod runtime;
 
 pub use runtime::{
-    ActiveClipboard, ConnectivityOpportunity, CustomRelay, CustomRelayMutationRejection,
-    CustomRelayMutationResult, Device, EntryNotResendableReason, InvitationAvailability,
-    InvitationIssued, JoinSpaceRejectionReason, JoinSpaceStatus, JoinSpaceTerminationReason,
-    JoinedSpace, LocalDevice, MobileEngine, MobileStartupLifecycle, PeerConnectionRefresh,
+    ActiveClipboard, ConfigImportRejectionReason, ConnectivityOpportunity, CustomRelay,
+    CustomRelayMutationRejection, CustomRelayMutationResult, Device, EntryNotResendableReason,
+    InvitationAvailability, InvitationIssued, JoinSpaceRejectionReason, JoinSpaceStatus,
+    JoinSpaceTerminationReason, JoinedSpace, LocalDevice, MobileEngine, MobileStartupLifecycle,
+    PeerConnectionRefresh, ReceiveItem, ReceiveProgress, ReceiveRetryOutcome, RejectedConfigImport,
     RelayEntrySource, RelayOverview, RelayOverviewEntry, RelayRoutingMode, RelaySaveResult,
     ResendEntryOutcome, SendReport, SessionRecovery, SpaceCreated, SpaceInvitation, SpaceState,
     WorkspaceConvergence, WorkspaceConvergenceFailureCategory, WorkspaceConvergencePhase,

@@ -23,6 +23,8 @@
 //!   its state machine had no dispatcher, while the real admit path runs
 //!   through `PairingInboundOrchestrator`.
 
+use crate::facade::clipboard::{RetryEntryReceiveError, RetryEntryReceiveOutcome};
+use crate::transfer::blob::facade::TransferCancellationWait;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +42,7 @@ use crate::facade::{
     ExportFileSourcePort, FileExportDestination, MembershipDiagnosticsView, MembershipReadiness,
     QueryMembershipDiagnosticsError, QueryMembershipReadinessError, ResourceFacadeError,
 };
+use crate::settings::diagnostics::DiagnosticsFacadeError;
 use crate::space::PeerConnectionError;
 
 pub use crate::space::{DeviceGroupChoicesView, QueryDeviceGroupChoicesError};
@@ -113,6 +116,10 @@ mod device_group_choice_error_tests {
 }
 use crate::clipboard::active::ActiveClipboardFacade;
 use crate::clipboard::history::maintenance_runtime::HistoryMaintenanceRuntime;
+use crate::clipboard::history_tags::{
+    HistoryEntryTagSummaryView, HistoryTagBatchView, HistoryTagCreatedView, HistoryTagError,
+    HistoryTagMergeView, HistoryTagRenameView, HistoryTagView, HistoryTags,
+};
 use crate::device::query_local_device::QueryLocalDeviceUseCase;
 use crate::facade::settings::{
     GeneralSettingsPatch, RelayConfigurationEntry, RelayConfigurationMutation,
@@ -128,12 +135,12 @@ use crate::facade::upgrade::UpgradeFacade;
 use crate::facade::{
     BlobTransferError, BlobTransferFacade, ChangeEncryptionPassphraseError, ClipboardCaptureFacade,
     ClipboardHistoryFacade, ClipboardOutboundFacade, ClipboardRestoreError, ClipboardRestoreFacade,
-    ClipboardSyncError, ClipboardSyncFacade, DiagnosticsFacade, DispatchEntryOutcome,
-    FetchBlobCommand, FetchBlobResult, FetchBlobToPathCommand, FetchBlobToPathResult,
-    LocalDeviceInfo, ProbeProfileKeyAccessError, PublishBlobCommand, PublishBlobPathCommand,
-    PublishBlobResult, QuerySpaceAccessStateError, ResendEntryCommand, ResendEntryError,
-    ResendReport, ResourceFacade, SearchFacade, SearchFacadeError, SearchPageView,
-    SearchQueryInput, SearchRebuildAcceptedView, SearchStatusView, SettingsFacade,
+    ClipboardSyncError, ClipboardSyncFacade, DebugStatusView, DiagnosticsFacade,
+    DispatchEntryOutcome, FetchBlobCommand, FetchBlobResult, FetchBlobToPathCommand,
+    FetchBlobToPathResult, LocalDeviceInfo, ProbeProfileKeyAccessError, PublishBlobCommand,
+    PublishBlobPathCommand, PublishBlobResult, QuerySpaceAccessStateError, ResendEntryCommand,
+    ResendEntryError, ResendReport, ResourceFacade, SearchFacade, SearchFacadeError,
+    SearchPageView, SearchQueryInput, SearchRebuildAcceptedView, SearchStatusView, SettingsFacade,
     SettingsFacadeError, SpaceAccessState, SpaceFacade, StorageFacade,
 };
 use crate::profile::probe_profile_key_access::ProbeProfileKeyAccessUseCase;
@@ -142,7 +149,7 @@ use crate::space::{
     NetworkRecoveryStatus, RecoverSpaceSessionError, RecoverSpaceSessionResult,
 };
 use uc_core::crypto::domain::Passphrase;
-use uc_core::ids::DeviceId;
+use uc_core::ids::{DeviceId, EntryId};
 use uc_core::ports::{PeerReachabilityChanged, ReachabilityState};
 use uc_core::ClipboardChangeOrigin;
 use uc_core::SystemClipboardSnapshot;
@@ -294,6 +301,92 @@ impl AppFacade {
     ) -> Result<bool, crate::facade::ClipboardHistoryError> {
         self.clipboard_history
             .toggle_favorite(entry_id, is_favorited)
+            .await
+    }
+
+    /// 本机历史标签动作的共同前置条件：加密会话已解锁，否则失败关闭。
+    async fn require_history_tag_session(&self) -> Result<&HistoryTags, HistoryTagError> {
+        let state = self
+            .space
+            .query_space_access_state()
+            .await
+            .map_err(|source| HistoryTagError::Internal(source.into()))?;
+        if state.session_ready {
+            Ok(self.clipboard_history.history_tags())
+        } else {
+            Err(HistoryTagError::Locked)
+        }
+    }
+
+    pub async fn list_history_tags(&self) -> Result<Vec<HistoryTagView>, HistoryTagError> {
+        self.require_history_tag_session().await?.list().await
+    }
+
+    pub async fn create_history_tag(
+        &self,
+        name: &str,
+    ) -> Result<HistoryTagCreatedView, HistoryTagError> {
+        self.require_history_tag_session().await?.create(name).await
+    }
+
+    pub async fn rename_history_tag(
+        &self,
+        tag_id: &str,
+        name: &str,
+    ) -> Result<HistoryTagRenameView, HistoryTagError> {
+        self.require_history_tag_session()
+            .await?
+            .rename(tag_id, name)
+            .await
+    }
+
+    pub async fn add_history_tag_to_entries(
+        &self,
+        tag_id: &str,
+        entry_ids: &[String],
+    ) -> Result<HistoryTagBatchView, HistoryTagError> {
+        self.require_history_tag_session()
+            .await?
+            .add_to_entries(tag_id, entry_ids)
+            .await
+    }
+
+    pub async fn remove_history_tag_from_entries(
+        &self,
+        tag_id: &str,
+        entry_ids: &[String],
+    ) -> Result<HistoryTagBatchView, HistoryTagError> {
+        self.require_history_tag_session()
+            .await?
+            .remove_from_entries(tag_id, entry_ids)
+            .await
+    }
+
+    pub async fn summarize_history_entry_tags(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<HistoryEntryTagSummaryView, HistoryTagError> {
+        self.require_history_tag_session()
+            .await?
+            .summarize_entries(entry_ids)
+            .await
+    }
+
+    pub async fn merge_history_tags(
+        &self,
+        source_tag_ids: &[String],
+        target_tag_id: &str,
+    ) -> Result<HistoryTagMergeView, HistoryTagError> {
+        self.require_history_tag_session()
+            .await?
+            .merge(source_tag_ids, target_tag_id)
+            .await
+    }
+
+    pub async fn delete_history_tag(&self, tag_id: &str) -> Result<u32, HistoryTagError> {
+        self.require_history_tag_session()
+            .await?
+            .delete(tag_id)
             .await
     }
 
@@ -656,6 +749,17 @@ impl AppFacade {
         self.clipboard_sync.list_entry_receive_progress().await
     }
 
+    pub async fn retry_entry_receive(
+        &self,
+        entry_id: EntryId,
+        expected_attempt_id: String,
+        item_ids: Vec<String>,
+    ) -> Result<RetryEntryReceiveOutcome, RetryEntryReceiveError> {
+        self.clipboard_sync
+            .retry_entry_receive(entry_id, expected_attempt_id, item_ids)
+            .await
+    }
+
     pub async fn cancel_entry_receive(
         &self,
         entry_id: &uc_core::ids::EntryId,
@@ -757,21 +861,14 @@ impl AppFacade {
             .await
     }
 
-    /// 取消一次进行中的 inbound 文件传输。
-    ///
-    /// 接收方主动撤回 fetch:trigger 内部 cancellation token + 撕掉
-    /// iroh-blobs Downloader 用的 QUIC connection + 落 `Cancelled`
-    /// domain event。幂等:同一 `transfer_id` 不在 inflight registry
-    /// 时(没有进行中的 fetch / 已经被取消过)返回 `Ok(NotInflight)`,
-    /// 实际撤回则返回 `Ok(Cancelled)` —— timeout sweep / 删除流程靠这个
-    /// 区分来决定是否要走 fallback 终结(例如 `mark_failed` pending 行)。
+    /// 请求本项停止并等待实际结算；五秒只结束调用等待，不放弃后台收尾。
     pub async fn cancel_inbound_transfer(
         &self,
         transfer_id: &str,
         reason: uc_core::FileTransferCancellationReason,
     ) -> Result<crate::facade::InboundCancelOutcome, BlobTransferError> {
         self.blob_transfer
-            .cancel_inbound_transfer(transfer_id, reason)
+            .cancel_inbound_transfer(transfer_id, reason, TransferCancellationWait::Bounded)
             .await
     }
 
@@ -919,11 +1016,14 @@ impl AppFacade {
         &self,
         password: &uc_core::crypto::domain::Passphrase,
         source: &Path,
+        replace_rejected_import: bool,
     ) -> Result<
         uc_core::ports::config_migration::StagedConfigImport,
         uc_core::ports::config_migration::ConfigMigrationError,
     > {
-        self.config_migration.stage_import(password, source).await
+        self.config_migration
+            .stage_import(password, source, replace_rejected_import)
+            .await
     }
 
     pub async fn member_sync_preferences(
@@ -949,17 +1049,14 @@ impl AppFacade {
         self.space.space_protection().await
     }
 
-    pub async fn diagnostics_status(
-        &self,
-    ) -> Result<crate::facade::DebugStatusView, crate::facade::DiagnosticsFacadeError> {
-        self.diagnostics.debug_status().await
-    }
-
-    pub async fn update_debug_mode(
-        &self,
-        enabled: bool,
-    ) -> Result<crate::facade::UpdateDebugModeView, crate::facade::DiagnosticsFacadeError> {
-        self.diagnostics.set_debug_mode(enabled).await
+    pub async fn diagnostics_status(&self) -> Result<DebugStatusView, DiagnosticsFacadeError> {
+        let mut status = self.diagnostics.debug_status();
+        status.rejected_config_import = self
+            .config_migration
+            .query_rejected_import()
+            .await
+            .map_err(DiagnosticsFacadeError::ImportStatus)?;
+        Ok(status)
     }
 
     pub async fn export_diagnostic_logs(
@@ -1009,30 +1106,13 @@ impl AppFacade {
             .update(SettingsPatch {
                 general: Some(GeneralSettingsPatch {
                     device_name: Some(Some(device_name)),
-                    auto_start: None,
-                    startup_mode: None,
-                    restore_last_entry_on_startup: None,
-                    auto_check_update: None,
-                    auto_download_update: None,
-                    theme: None,
-                    theme_color: None,
-                    theme_color_light: None,
-                    theme_color_dark: None,
-                    theme_overrides_light: None,
-                    theme_overrides_dark: None,
-                    language: None,
-                    update_channel: None,
-                    usage_analytics_enabled: None,
-                    debug_mode: None,
                 }),
                 sync: None,
                 retention_policy: None,
                 security: None,
                 pairing: None,
-                keyboard_shortcuts: None,
                 file_sync: None,
                 network: None,
-                quick_panel: None,
             })
             .await?;
         Ok(())

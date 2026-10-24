@@ -1,8 +1,12 @@
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::error::GroupUpdateRejection;
 use crate::error_class::ErrorClass;
 use crate::ids::{DeviceId, SpaceId};
 use crate::space_access::GroupAdmission;
@@ -405,6 +409,50 @@ pub enum GroupUpdateDeliveryStatus {
     Completed,
     Pending { next_attempt_at_ms: i64 },
     Rejected,
+}
+
+/// 某收件人队首更新目前的投递状况。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupUpdateDeliveryCondition {
+    /// 尚未尝试。
+    NotAttempted,
+    /// 上次尝试时收件人不可达或传输失败，按退避自动重试。
+    Unreachable,
+    /// 上次尝试时收件人已认证连接但暂时无法应用，按退避自动重试。
+    ReceiverUnavailable,
+    /// 收件人拒绝；`ByReceiver` 不会自动重发，`Unclassified` 仅在收件人重新通过认证后重新评估。
+    Rejected(GroupUpdateRejection),
+}
+
+/// 某收件人的队首（最早 epoch）未确认更新；已确认的更新不再出现。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupUpdateRecipientDelivery {
+    pub recipient: DeviceId,
+    pub epoch: u64,
+    pub condition: GroupUpdateDeliveryCondition,
+    pub attempts: u32,
+    pub next_attempt_at_ms: i64,
+}
+
+impl GroupUpdateDeliveryStatus {
+    /// 按各收件人队首状况汇总空间级状态：任何拒绝优先，其余取最早的下次尝试时间。
+    pub fn summarize(deliveries: &[GroupUpdateRecipientDelivery]) -> Self {
+        if deliveries.iter().any(|delivery| {
+            matches!(
+                delivery.condition,
+                GroupUpdateDeliveryCondition::Rejected(_)
+            )
+        }) {
+            return Self::Rejected;
+        }
+        deliveries
+            .iter()
+            .map(|delivery| delivery.next_attempt_at_ms)
+            .min()
+            .map_or(Self::Completed, |next_attempt_at_ms| Self::Pending {
+                next_attempt_at_ms,
+            })
+    }
 }
 
 impl PendingGroupUpdate {
@@ -897,6 +945,8 @@ pub struct SpaceKeyMaterial {
     pending_group_updates: Vec<PendingGroupUpdate>,
     #[serde(default)]
     pending_group_admission_replays: Vec<PendingGroupAdmissionReplay>,
+    #[serde(default)]
+    applied_group_updates: BTreeMap<u64, [u8; 32]>,
     updated_at_ms: i64,
 }
 
@@ -920,6 +970,7 @@ impl SpaceKeyMaterial {
             key_catalog,
             pending_group_updates: Vec::new(),
             pending_group_admission_replays: Vec::new(),
+            applied_group_updates: BTreeMap::new(),
             updated_at_ms,
         }
     }
@@ -941,6 +992,28 @@ impl SpaceKeyMaterial {
 
     pub fn key_catalog(&self) -> &[u8] {
         &self.key_catalog
+    }
+    pub fn applied_group_update_digest(&self, epoch: GroupEpoch) -> Option<&[u8; 32]> {
+        self.applied_group_updates.get(&epoch.value())
+    }
+    /// 只在真实 MLS 更新已经验证且材料形成后记入，随该材料一起保存。
+    pub fn record_applied_group_update(
+        &mut self,
+        epoch: GroupEpoch,
+        digest: [u8; 32],
+    ) -> Result<(), KeyEpochError> {
+        if epoch > self.state.epoch() {
+            return Err(KeyEpochError::StateIssue(KeyEpochStateIssue::EpochMismatch));
+        }
+        if self
+            .applied_group_updates
+            .get(&epoch.value())
+            .is_some_and(|known| known != &digest)
+        {
+            return Err(KeyEpochError::StateIssue(KeyEpochStateIssue::EpochMismatch));
+        }
+        self.applied_group_updates.insert(epoch.value(), digest);
+        Ok(())
     }
 
     pub fn pending_group_updates(&self) -> &[PendingGroupUpdate] {
@@ -985,6 +1058,11 @@ impl SpaceKeyMaterial {
     pub fn with_pending_group_updates_from(mut self, previous: &Self) -> Self {
         self.pending_group_updates = previous.pending_group_updates.clone();
         self.pending_group_admission_replays = previous.pending_group_admission_replays.clone();
+        if self.state.space_id() == previous.state.space_id()
+            && self.state.protection_group_id() == previous.state.protection_group_id()
+        {
+            self.applied_group_updates = previous.applied_group_updates.clone();
+        }
         self
     }
 
@@ -993,6 +1071,11 @@ impl SpaceKeyMaterial {
         previous: &Self,
         excluded_recipient: &DeviceId,
     ) -> Self {
+        if self.state.space_id() == previous.state.space_id()
+            && self.state.protection_group_id() == previous.state.protection_group_id()
+        {
+            self.applied_group_updates = previous.applied_group_updates.clone();
+        }
         self.pending_group_updates = previous
             .pending_group_updates
             .iter()
@@ -1013,6 +1096,11 @@ impl SpaceKeyMaterial {
         previous: &Self,
         excluded_recipients: &[DeviceId],
     ) -> Self {
+        if self.state.space_id() == previous.state.space_id()
+            && self.state.protection_group_id() == previous.state.protection_group_id()
+        {
+            self.applied_group_updates = previous.applied_group_updates.clone();
+        }
         self.pending_group_updates = previous
             .pending_group_updates
             .iter()
@@ -1342,6 +1430,8 @@ pub enum KeyEpochStateIssue {
     RecoveryRequired,
     UnsupportedUpdate,
     OutOfOrderUpdate,
+    MissingPredecessor,
+    UnverifiedReplay,
     UnsupportedOperation,
     InvalidStage,
     StateChanged,

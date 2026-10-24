@@ -10,7 +10,7 @@ use super::error::{
 use super::member::SpaceMember;
 use super::membership_history::MembershipHistoryMessage;
 use super::revocation::{
-    GroupEpoch, GroupRevocationResult, GroupUpdateDeliveryStatus, KeyEpochError,
+    GroupEpoch, GroupRevocationResult, GroupUpdateRecipientDelivery, KeyEpochError,
     PendingGroupUpdate, PreparedRevocationResolution, RevocationId, RevocationRecord,
     RevocationStage, SpaceKeyMaterial,
 };
@@ -106,12 +106,15 @@ pub trait RevocationRepositoryPort: Send + Sync {
         space_id: &SpaceId,
     ) -> Result<Option<SpaceKeyMaterial>, KeyEpochError>;
 
-    /// 按到期时间读取投递任务；恢复机会只唤醒匹配设备，不能释放拒绝状态。
+    /// 按到期时间读取投递任务。恢复机会（`online_peer`）只唤醒该设备的退避；明确拒绝不会被释放，
+    /// 无原因拒绝仅在该设备重新通过认证且重新评估间隔已过时再次可投。`verified_history_peer`
+    /// 是当前可信历史位置的新确认，仅允许一次验证后重试；拒绝状态仍保留到真实应用 ACK。
     async fn due_group_updates(
         &self,
         space_id: &SpaceId,
         now_ms: i64,
         online_peer: Option<DeviceId>,
+        verified_history_peer: Option<DeviceId>,
     ) -> Result<Vec<PendingGroupUpdate>, KeyEpochError>;
 
     /// 记录发送失败，不更改安全事实或确认结果。
@@ -122,10 +125,10 @@ pub trait RevocationRepositoryPort: Send + Sync {
         now_ms: i64,
     ) -> Result<usize, KeyEpochError>;
 
-    async fn group_update_delivery_status(
+    async fn group_update_deliveries(
         &self,
         space_id: &SpaceId,
-    ) -> Result<GroupUpdateDeliveryStatus, KeyEpochError>;
+    ) -> Result<Vec<GroupUpdateRecipientDelivery>, KeyEpochError>;
 
     async fn begin_revocation(
         &self,
@@ -244,6 +247,7 @@ pub trait GroupRevocationPort: Send + Sync {
         &self,
         now_ms: i64,
         online_peer: Option<DeviceId>,
+        verified_history_peer: Option<DeviceId>,
     ) -> Result<Vec<PendingGroupUpdate>, KeyEpochError>;
 
     async fn record_space_group_update_failures(
@@ -252,9 +256,9 @@ pub trait GroupRevocationPort: Send + Sync {
         now_ms: i64,
     ) -> Result<usize, KeyEpochError>;
 
-    async fn space_group_update_delivery_status(
+    async fn space_group_update_deliveries(
         &self,
-    ) -> Result<GroupUpdateDeliveryStatus, KeyEpochError>;
+    ) -> Result<Vec<GroupUpdateRecipientDelivery>, KeyEpochError>;
 
     async fn acknowledge_space_group_update(
         &self,
@@ -304,17 +308,6 @@ pub trait MembershipHistoryExchangeEndpointPort: Send + Sync {
         source_device_id: &DeviceId,
         message: MembershipHistoryMessage,
     ) -> Result<MembershipHistoryMessage, MembershipHistoryExchangeError>;
-}
-
-/// 成员历史对内容发送的最小限制查询。
-///
-/// 待本机决定、分叉或无效的对端不得接收新的业务内容。发送流程只需要知道某个
-/// 设备是否已被本机阻断，不能读取成员历史或收敛状态。
-#[async_trait]
-pub trait ContentExchangeGatePort: Send + Sync {
-    /// 返回 `true` 时，调用方不得再向该设备发送新的业务内容。
-    /// 实现无法安全判断时必须返回 `true`，保持失败关闭。
-    async fn is_locally_removed(&self, device_id: &DeviceId) -> bool;
 }
 
 /// 准入前由成员历史负责人给出的唯一决定。

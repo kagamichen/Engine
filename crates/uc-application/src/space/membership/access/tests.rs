@@ -190,6 +190,8 @@ fn space_record(ledger: &MembershipLedger) -> MembershipRecord {
         ledger: ledger.snapshot(),
         history_exchange: Default::default(),
         branch_recovery: Default::default(),
+        group_update_recovery: None,
+        prepared_group_updates: Default::default(),
     }))
 }
 
@@ -199,7 +201,7 @@ async fn unbound_access_refuses_every_peer() {
 
     assert!(matches!(
         access.is_admitted(&device("device-b")).await,
-        Err(PeerAdmissionError::Unavailable)
+        Err(PeerAdmissionError::ReadFailed { .. })
     ));
     assert!(matches!(
         access.known_peer_identities().await,

@@ -285,9 +285,59 @@ fn history_management_contract_preserves_results_without_debugging_user_content(
             uc_engine::Operation::ClearHistory,
             uc_engine::OperationKind::ClearHistory,
         ),
+        (
+            uc_engine::Operation::ListHistoryTags,
+            uc_engine::OperationKind::ListHistoryTags,
+        ),
+        (
+            uc_engine::Operation::CreateHistoryTag(uc_engine::CreateHistoryTagInput {
+                name: "private tag name".into(),
+            }),
+            uc_engine::OperationKind::CreateHistoryTag,
+        ),
+        (
+            uc_engine::Operation::RenameHistoryTag(uc_engine::RenameHistoryTagInput {
+                tag_id: "tag-1".into(),
+                name: "private tag name".into(),
+            }),
+            uc_engine::OperationKind::RenameHistoryTag,
+        ),
+        (
+            uc_engine::Operation::AddHistoryTagToEntries(uc_engine::HistoryTagEntriesInput {
+                tag_id: "tag-1".into(),
+                entry_ids: vec!["entry-1".into()],
+            }),
+            uc_engine::OperationKind::AddHistoryTagToEntries,
+        ),
+        (
+            uc_engine::Operation::RemoveHistoryTagFromEntries(uc_engine::HistoryTagEntriesInput {
+                tag_id: "tag-1".into(),
+                entry_ids: vec!["entry-1".into()],
+            }),
+            uc_engine::OperationKind::RemoveHistoryTagFromEntries,
+        ),
+        (
+            uc_engine::Operation::SummarizeHistoryEntryTags(uc_engine::HistoryEntryTagsInput {
+                entry_ids: vec!["entry-1".into()],
+            }),
+            uc_engine::OperationKind::SummarizeHistoryEntryTags,
+        ),
+        (
+            uc_engine::Operation::MergeHistoryTags(uc_engine::MergeHistoryTagsInput {
+                source_tag_ids: vec!["tag-2".into()],
+                target_tag_id: "tag-1".into(),
+            }),
+            uc_engine::OperationKind::MergeHistoryTags,
+        ),
+        (
+            uc_engine::Operation::DeleteHistoryTag(uc_engine::HistoryTagInput {
+                tag_id: "tag-1".into(),
+            }),
+            uc_engine::OperationKind::DeleteHistoryTag,
+        ),
     ];
-    for (operation, expected) in operations {
-        assert_eq!(operation.kind(), expected);
+    for (operation, expected) in &operations {
+        assert_eq!(operation.kind(), *expected);
     }
 
     let results = [
@@ -330,8 +380,25 @@ fn history_management_contract_preserves_results_without_debugging_user_content(
             inline_data: Some(b"private inline content".to_vec()),
         }),
     ];
-    let debug = format!("{results:?}");
+    let tag = uc_engine::HistoryTagSummary {
+        tag_id: "tag-1".into(),
+        name: Some("private tag name".into()),
+        created_at_ms: 1,
+        entry_count: 2,
+    };
+    let tag_results = [
+        uc_engine::OperationResult::HistoryTags(vec![tag.clone()]),
+        uc_engine::OperationResult::HistoryTagCreated(uc_engine::HistoryTagCreatedSummary {
+            tag: tag.clone(),
+            created: true,
+        }),
+        uc_engine::OperationResult::HistoryTagRenamed(uc_engine::HistoryTagRenameSummary::Renamed(
+            tag,
+        )),
+    ];
+    let debug = format!("{results:?} {tag_results:?} {operations:?}");
     for secret in [
+        "private tag name",
         "private preview",
         "private-tag",
         "private.example",
@@ -460,10 +527,6 @@ fn settings_contract_preserves_updates_and_probe_outcomes_without_debugging_user
     let mut settings = uc_engine::SettingsSummary::default();
     settings.general.device_name = Some("Private Mac".into());
     settings
-        .general
-        .theme_overrides_light
-        .insert("primary".into(), "private-theme-value".into());
-    settings
         .network
         .custom_relay_urls
         .push("https://private-relay.example".into());
@@ -491,7 +554,6 @@ fn settings_contract_preserves_updates_and_probe_outcomes_without_debugging_user
     let debug = format!("{save_relay:?} {values:?}");
     for secret in [
         "Private Mac",
-        "private-theme-value",
         "private-relay.example",
         "/private/export/path",
         "private validation detail",
@@ -543,10 +605,6 @@ fn diagnostics_contract_exports_through_host_handles_without_debugging_paths() {
         Operation::QueryDiagnostics.kind(),
         OperationKind::QueryDiagnostics
     );
-    assert_eq!(
-        Operation::UpdateDebugMode(uc_engine::UpdateDebugModeInput { enabled: true }).kind(),
-        OperationKind::UpdateDebugMode
-    );
     let export = Operation::ExportDiagnosticLogs(uc_engine::ExportDiagnosticLogsInput {
         since_hours: Some(48),
         destination: uc_engine::HostFileHandle::new("private diagnostic destination"),
@@ -573,6 +631,7 @@ fn config_migration_contract_uses_host_handles_and_redacts_identity_metadata() {
         password: uc_engine::SecretString::new("private config password"),
     });
     let stage = Operation::StageConfigImport(uc_engine::StageConfigImportInput {
+        replace_rejected_import: false,
         source: uc_engine::HostFileHandle::new("private config source"),
         password: uc_engine::SecretString::new("private config password"),
     });
@@ -947,7 +1006,22 @@ fn receive_progress_and_cancellation_have_stable_operations_and_results() {
         completed_bytes: 40,
         items_total: 2,
         items_completed: 1,
+        items: vec![uc_engine::ReceiveItemSummary {
+            item_id: "stable-item".into(),
+            kind: uc_engine::ReceiveItemKind::File,
+            state: "failed".into(),
+            failure_reason: Some(uc_engine::ReceiveItemFailureReason::IntegrityCheckFailed),
+        }],
     };
+    let mut serialized = serde_json::to_value(&progress).unwrap();
+    assert_eq!(serialized["items"][0]["kind"], "file");
+    assert_eq!(
+        serialized["items"][0]["failure_reason"],
+        "integrity_check_failed"
+    );
+    serialized.as_object_mut().unwrap().remove("items");
+    let legacy: uc_engine::ReceiveProgressSummary = serde_json::from_value(serialized).unwrap();
+    assert!(legacy.items.is_empty());
     assert_eq!(
         uc_engine::OperationResult::EntryReceiveProgress(Some(progress.clone())),
         uc_engine::OperationResult::EntryReceiveProgress(Some(progress.clone()))
@@ -963,23 +1037,41 @@ fn receive_progress_and_cancellation_have_stable_operations_and_results() {
                 completed_bytes: 40,
                 items_total: 2,
                 items_completed: 1,
+                items: vec![uc_engine::ReceiveItemSummary {
+                    item_id: "stable-item".into(),
+                    kind: uc_engine::ReceiveItemKind::File,
+                    state: "failed".into(),
+                    failure_reason: Some(uc_engine::ReceiveItemFailureReason::IntegrityCheckFailed),
+                }],
             },
         ])
     );
 
     let receive_outcomes = [
         uc_engine::EntryReceiveCancellationOutcome::Cancelled,
+        uc_engine::EntryReceiveCancellationOutcome::CancellationIncomplete,
         uc_engine::EntryReceiveCancellationOutcome::NotReceiving,
         uc_engine::EntryReceiveCancellationOutcome::TooLate,
         uc_engine::EntryReceiveCancellationOutcome::AlreadyTerminal,
         uc_engine::EntryReceiveCancellationOutcome::Superseded,
     ];
-    assert_eq!(receive_outcomes.len(), 5);
+    assert_eq!(receive_outcomes.len(), 6);
     let transfer_outcomes = [
         uc_engine::InboundTransferCancellationOutcome::Cancelled,
+        uc_engine::InboundTransferCancellationOutcome::CancellationIncomplete,
         uc_engine::InboundTransferCancellationOutcome::NotInflight,
     ];
-    assert_eq!(transfer_outcomes.len(), 2);
+    assert_eq!(transfer_outcomes.len(), 3);
+    assert_eq!(
+        serde_json::to_value(uc_engine::EntryReceiveCancellationOutcome::CancellationIncomplete)
+            .expect("entry cancellation encoding"),
+        serde_json::json!("cancellation_incomplete")
+    );
+    assert_eq!(
+        serde_json::to_value(uc_engine::InboundTransferCancellationOutcome::CancellationIncomplete)
+            .expect("transfer cancellation encoding"),
+        serde_json::json!("cancellation_incomplete")
+    );
 }
 
 #[test]
@@ -1468,6 +1560,7 @@ fn device_trust_debug_output_redacts_device_facts_and_change_ids() {
             compatibility: uc_engine::DeviceCompatibilitySummary::Compatible,
             sync_relationship: uc_engine::DeviceSyncRelationshipSummary::Usable,
             pairing_confirmation: None,
+            group_update: None,
             available_actions: Vec::new(),
             blocked_reason: None,
         });
@@ -1489,6 +1582,7 @@ fn pairing_confirmation_is_optional_and_uses_stable_names() {
         compatibility: uc_engine::DeviceCompatibilitySummary::Compatible,
         sync_relationship: uc_engine::DeviceSyncRelationshipSummary::Usable,
         pairing_confirmation: None,
+        group_update: None,
         available_actions: Vec::new(),
         blocked_reason: None,
     };
@@ -1910,4 +2004,63 @@ fn device_summary_debug_output_redacts_display_name() {
     assert!(!debug.contains("Private Phone Name"));
     assert!(debug.contains("device-1"));
     assert!(debug.contains("online"));
+}
+
+#[test]
+fn receive_retry_has_one_operation_and_preserves_all_business_results() {
+    use uc_engine::{
+        EntryReceiveRetryOutcome, ReceiveRetryUnavailableReason, RetryEntryReceiveInput,
+    };
+    let operation = uc_engine::Operation::RetryEntryReceive(RetryEntryReceiveInput {
+        entry_id: "entry".into(),
+        expected_attempt_id: "old".into(),
+        item_ids: vec!["item".into()],
+    });
+    assert_eq!(
+        operation.kind(),
+        uc_engine::OperationKind::RetryEntryReceive
+    );
+    assert_eq!(
+        serde_json::to_value(operation.kind()).unwrap(),
+        "retry_entry_receive"
+    );
+    for (result, expected) in [
+        (
+            EntryReceiveRetryOutcome::Accepted {
+                attempt_id: "new".into(),
+            },
+            serde_json::json!({"kind":"accepted", "attempt_id":"new"}),
+        ),
+        (
+            EntryReceiveRetryOutcome::AlreadyReceiving,
+            serde_json::json!({"kind":"already_receiving"}),
+        ),
+        (
+            EntryReceiveRetryOutcome::Superseded,
+            serde_json::json!({"kind":"superseded"}),
+        ),
+        (
+            EntryReceiveRetryOutcome::CancellationIncomplete,
+            serde_json::json!({"kind":"cancellation_incomplete"}),
+        ),
+        (
+            EntryReceiveRetryOutcome::Unavailable {
+                reason: ReceiveRetryUnavailableReason::SourceUnavailable,
+            },
+            serde_json::json!({"kind":"unavailable", "reason":"source_unavailable"}),
+        ),
+        (
+            EntryReceiveRetryOutcome::Unavailable {
+                reason: ReceiveRetryUnavailableReason::AccessDenied,
+            },
+            serde_json::json!({"kind":"unavailable", "reason":"access_denied"}),
+        ),
+    ] {
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            serde_json::from_value::<EntryReceiveRetryOutcome>(encoded).unwrap(),
+            result
+        );
+    }
 }

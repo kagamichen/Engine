@@ -27,6 +27,9 @@ mod lifecycle_targets;
 #[path = "public_contract/startup_lifecycle.rs"]
 mod startup_lifecycle;
 
+#[path = "public_contract/rejected_import.rs"]
+mod rejected_import;
+
 #[test]
 fn core_version_uses_the_binding_package_version() {
     assert_eq!(core_version(), format!("v{}", env!("CARGO_PKG_VERSION")));
@@ -37,8 +40,8 @@ fn process_observability_is_host_owned_reused_and_lifecycle_safe() {
     let _guard = lock(&ENGINE_TEST_LOCK);
     let directory = tempfile::tempdir().expect("temporary directory");
     let host = Arc::new(MemoryHost::new(directory.path()));
-    fs::create_dir_all(&host.cache).expect("cache directory");
-    fs::write(host.cache.join("logs"), b"blocks log directory").expect("blocking log file");
+    fs::create_dir_all(&host.private_data).expect("private data directory");
+    fs::write(host.private_data.join("logs"), b"blocks log directory").expect("blocking log file");
     let config = BindingObservabilityConfig {
         service_version: "1.2.3".to_owned(),
         environment: BindingDeploymentEnvironment::Test,

@@ -19,8 +19,14 @@ import { fileURLToPath } from 'node:url'
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const REPOSITORY_ROOT = realpathSync(resolve(SCRIPT_DIR, '../..'))
 
-// 随仓库发布的第三方源码副本：只允许 uc-infra 以 third_party 下的路径依赖引用，
+// 随仓库发布的第三方源码副本：只允许 uc-infra-p2p 以 third_party 下的路径依赖引用，
 // 这样依赖 Engine 的仓库不需要重复任何 [patch]。
+const NETWORK_STACK_CONSUMERS = {
+  'uc-infra-p2p': ['iroh', 'iroh-relay', 'iroh-blobs', 'iroh-tickets'],
+  'uc-infra-profile': ['iroh'],
+  'uc-infra-storage': ['iroh'],
+  'uc-connectivity-relay': ['iroh-relay'],
+}
 const VENDORED_THIRD_PARTY_PACKAGES = ['iroh-mdns-address-lookup', 'swarm-discovery']
 
 const EXPECTED_PACKAGES = [
@@ -32,7 +38,13 @@ const EXPECTED_PACKAGES = [
   'uc-core',
   'uc-engine',
   'uc-engine-uniffi',
-  'uc-infra',
+  'uc-infra-content',
+  'uc-infra-crypto',
+  'uc-infra-local',
+  'uc-infra-p2p',
+  'uc-infra-profile',
+  'uc-infra-security',
+  'uc-infra-storage',
   'uc-mobile',
   'uc-mobile-lan',
   'uc-mobile-proto',
@@ -49,7 +61,13 @@ const INTERNAL_PACKAGES = new Set([
   'uc-application',
   'uc-content-hash',
   'uc-core',
-  'uc-infra',
+  'uc-infra-content',
+  'uc-infra-crypto',
+  'uc-infra-local',
+  'uc-infra-p2p',
+  'uc-infra-profile',
+  'uc-infra-security',
+  'uc-infra-storage',
   'uc-mobile',
   'uc-mobile-lan',
   'uc-mobile-proto',
@@ -62,6 +80,7 @@ const INTERNAL_PACKAGES = new Set([
 // 无存储、无密钥的通用库，任何新增依赖都必须先更新这里并说明理由。
 const SYNC_PROTOCOL_ALLOWED_DEPENDENCIES = [
   'anyhow',
+  'base64',
   'bytes',
   'postcard',
   'serde',
@@ -95,7 +114,7 @@ function read(relativePath) {
 }
 
 /// 排除测试文件与测试台目录后的 Rust 源码；`excludedPaths` 为另需排除的仓库相对路径。
-function productionSources(relativeRoot, excludedPaths = []) {
+function productionSources(relativeRoot, excludedPaths = [], stripInlineTests = false) {
   const root = join(REPOSITORY_ROOT, relativeRoot)
   const excluded = new Set(excludedPaths)
   const sources = []
@@ -111,7 +130,8 @@ function productionSources(relativeRoot, excludedPaths = []) {
         !/(^tests\.rs|_tests?\.rs)$/.test(entry.name) &&
         !excluded.has(relative(REPOSITORY_ROOT, path))
       ) {
-        sources.push(readFileSync(path, 'utf8'))
+        const source = readFileSync(path, 'utf8')
+        sources.push(stripInlineTests ? source.split('#[cfg(test)]')[0] : source)
       }
     }
   }
@@ -165,7 +185,7 @@ function parseJson(input, source) {
 
 function cargoMetadata() {
   const output = execFileSync(
-    'cargo',
+    resolve(import.meta.dirname, '../build-cache/bin/cargo'),
     ['metadata', '--no-deps', '--format-version', '1', '--locked'],
     { cwd: REPOSITORY_ROOT, encoding: 'utf8' }
   )
@@ -246,6 +266,25 @@ function checkWorkspaceShape(metadata) {
   return problems
 }
 
+function checkPackageSelectors(metadata, sources) {
+  const problems = []
+  const members = new Set(
+    metadata.workspace_members
+      .map(id => metadata.packages.find(candidate => candidate.id === id)?.name)
+      .filter(Boolean),
+  )
+  const selector = /package\(([A-Za-z0-9_-]+)\)|(?:\s-p|--package)[ =](uc-[A-Za-z0-9_-]+)/g
+  for (const { path, text } of sources.packageSelectors) {
+    for (const match of text.matchAll(selector)) {
+      const name = match[1] ?? match[2]
+      if (!members.has(name)) {
+        addProblem(problems, 'package selectors', `${path} selects ${name}, which is not a workspace package`)
+      }
+    }
+  }
+  return problems
+}
+
 function checkOpenMlsValidation(metadata) {
   const problems = []
   const validation = packageByName(metadata, 'openmls-validation')
@@ -264,7 +303,7 @@ function checkOpenMlsValidation(metadata) {
 
 function runOpenMlsValidation() {
   const result = spawnSync(
-    'cargo',
+    resolve(import.meta.dirname, '../build-cache/bin/cargo'),
     ['test', '-p', 'openmls-validation', '--test', 'revocation', '--locked'],
     { cwd: REPOSITORY_ROOT, encoding: 'utf8' }
   )
@@ -320,6 +359,13 @@ function checkLocalDependencies(metadata) {
           `${packageMetadata.name} depends on desktop-owned package ${dependency.name}`
         )
       }
+      const networkPackages = NETWORK_STACK_CONSUMERS[packageMetadata.name] ?? []
+      if (networkPackages.includes(dependency.name)) {
+        if (!dependency.path || resolve(dependency.path) !== join(REPOSITORY_ROOT, 'third_party', 'iroh', dependency.name)) {
+          addProblem(problems, 'network stack', `${packageMetadata.name} must use the vendored ${dependency.name}`)
+        }
+        continue
+      }
       if (!dependency.path) continue
       if (!pathIsInsideRepository(dependency.path)) {
         addProblem(
@@ -329,7 +375,7 @@ function checkLocalDependencies(metadata) {
         )
       } else if (
         VENDORED_THIRD_PARTY_PACKAGES.includes(dependency.name) &&
-        packageMetadata.name === 'uc-infra' &&
+        packageMetadata.name === 'uc-infra-p2p' &&
         relative(REPOSITORY_ROOT, resolve(dependency.path)) === join('third_party', dependency.name)
       ) {
         continue
@@ -485,9 +531,9 @@ function checkLanIsolation(metadata, sources) {
   const problems = []
   const engine = packageByName(metadata, 'uc-engine')
   const application = packageByName(metadata, 'uc-application')
-  const infra = packageByName(metadata, 'uc-infra')
+  const infraProfile = packageByName(metadata, 'uc-infra-profile')
 
-  for (const packageMetadata of [engine, application, infra]) {
+  for (const packageMetadata of [engine, application, infraProfile]) {
     if (featureItems(packageMetadata, 'default').includes('lan-compat')) {
       addProblem(problems, 'compatibility gate', `${packageMetadata.name} enables lan-compat by default`)
     }
@@ -495,7 +541,7 @@ function checkLanIsolation(metadata, sources) {
   for (const required of [
     'dep:uc-mobile-lan',
     'dep:uc-mobile-proto',
-    'uc-infra/lan-compat',
+    'uc-infra-storage/lan-compat',
   ]) {
     if (!featureItems(engine, 'lan-compat').includes(required)) {
       addProblem(problems, 'compatibility gate', `uc-engine/lan-compat is missing ${required}`)
@@ -504,8 +550,8 @@ function checkLanIsolation(metadata, sources) {
   if (normalDependency(application, 'uc-mobile-proto')) {
     addProblem(problems, 'compatibility gate', 'uc-application must not depend on uc-mobile-proto (moved to uc-mobile-lan)')
   }
-  if (!normalDependency(infra, 'network-interface')?.optional) {
-    addProblem(problems, 'compatibility gate', 'uc-infra must keep network-interface optional')
+  if (normalDependency(infraProfile, 'network-interface')) {
+    addProblem(problems, 'compatibility gate', 'uc-infra-profile must not depend on network-interface (mobile_sync moved to uc-mobile-lan)')
   }
   for (const consumerName of P2P_CONSUMERS) {
     const dependency = normalDependency(packageByName(metadata, consumerName), 'uc-engine')
@@ -557,7 +603,7 @@ function checkPlaintextScanner() {
 function checkProfileStorageGenerationOwnership(sources) {
   const problems = []
   const v3TransitionPath =
-    'crates/uc-infra/src/security/v3_admission_space_transition.rs'
+    'crates/uc-infra-profile/src/security/v3_admission_space_transition.rs'
   const forbiddenV3Dependencies = [
     'ProfileStorageUpgrade',
     'profile_storage_upgrade',
@@ -708,7 +754,7 @@ function checkMembershipConfirmationWatermarkOwnership(sources) {
     )
   }
 
-  const sponsorActivation = read('crates/uc-infra/src/space/admission/sponsor/complete.rs')
+  const sponsorActivation = read('crates/uc-infra-profile/src/space/admission/sponsor/complete.rs')
   if (/confirmed_position/.test(sponsorActivation)) {
     addProblem(
       problems,
@@ -726,7 +772,7 @@ function checkRetiredLegacyPairingRecovery() {
     'crates/uc-application/src/space/convergence/membership/legacy_upgrade_tests.rs',
     'crates/uc-core/src/membership/upgrade.rs',
     'crates/uc-core/tests/legacy_upgrade.rs',
-    'crates/uc-infra/src/network/iroh/legacy_upgrade_adapter.rs',
+    'crates/uc-infra-p2p/src/network/iroh/legacy_upgrade_adapter.rs',
   ]
   for (const path of retiredPaths) {
     if (existsSync(join(REPOSITORY_ROOT, path))) {
@@ -782,8 +828,8 @@ function checkRetiredPairingTransport(sources) {
     'crates/uc-core/src/ports/pairing/mod.rs',
     'crates/uc-core/src/ports/pairing/events.rs',
     'crates/uc-core/src/ports/pairing/session.rs',
-    'crates/uc-infra/src/pairing/session.rs',
-    'crates/uc-infra/src/pairing/wire.rs',
+    'crates/uc-infra-p2p/src/pairing/session.rs',
+    'crates/uc-infra-p2p/src/pairing/wire.rs',
   ]
   for (const path of retiredPaths) {
     if (existsSync(join(REPOSITORY_ROOT, path))) {
@@ -880,9 +926,9 @@ function checkApplicationMembershipCutover() {
     'crates/uc-application/src/space/membership/ledger',
     'crates/uc-application/src/space/membership/synchronize_history',
     'crates/uc-application/src/space/membership/anti_entropy.rs',
-    'crates/uc-infra/src/space/membership_ledger.rs',
-    'crates/uc-infra/src/space/membership_ledger',
-    'crates/uc-infra/src/space/adapters/membership_projection.rs',
+    'crates/uc-infra-profile/src/space/membership_ledger.rs',
+    'crates/uc-infra-profile/src/space/membership_ledger',
+    'crates/uc-infra-profile/src/space/adapters/membership_projection.rs',
     'crates/uc-engine/src/assembly/membership_events.rs',
     'crates/uc-core/src/membership/space_join_record.rs',
   ]
@@ -1362,7 +1408,7 @@ function checkDualInvitationEntry() {
     }
   }
 
-  const codecPath = 'crates/uc-infra/src/space/admission/full_invitation.rs'
+  const codecPath = 'crates/uc-sync-protocol/src/full_invitation.rs'
   const codec = read(codecPath)
   for (const required of [
     'FULL_INVITATION_PREFIX',
@@ -1429,8 +1475,8 @@ function checkDualInvitationEntry() {
   }
 
   for (const path of [
-    'crates/uc-infra/src/rendezvous/invitation_adapter.rs',
-    'crates/uc-infra/src/pairing/invitation_resolver.rs',
+    'crates/uc-infra-p2p/src/rendezvous/invitation_adapter.rs',
+    'crates/uc-infra-p2p/src/pairing/invitation_resolver.rs',
   ]) {
     if (/code\s*=\s*%code\.as_str\(\)/.test(read(path))) {
       addProblem(problems, 'dual invitation entry', `${path} logs a full invitation code`)
@@ -1442,10 +1488,9 @@ function checkDualInvitationEntry() {
 
 function checkInfraSpaceAdmissionOwnership() {
   const problems = []
-  const admissionRoot = 'crates/uc-infra/src/space/admission'
+  const admissionRoot = 'crates/uc-infra-profile/src/space/admission'
   const requiredEntries = [
     'mod.rs',
-    'full_invitation.rs',
     'security/mod.rs',
     'security/transition.rs',
     'repository/mod.rs',
@@ -1464,9 +1509,9 @@ function checkInfraSpaceAdmissionOwnership() {
     'sponsor/state.rs',
   ]
   const retiredEntries = [
-    'crates/uc-infra/src/db/repositories/space_join_record_store.rs',
-    'crates/uc-infra/src/network/iroh/admission_completion_recovery_adapter.rs',
-    'crates/uc-infra/src/pairing/admission_outbox_delivery.rs',
+    'crates/uc-infra-profile/src/db/repositories/space_join_record_store.rs',
+    'crates/uc-infra-p2p/src/network/iroh/admission_completion_recovery_adapter.rs',
+    'crates/uc-infra-p2p/src/pairing/admission_outbox_delivery.rs',
   ]
 
   for (const entry of requiredEntries) {
@@ -1499,30 +1544,34 @@ function checkInfraSpaceAdmissionOwnership() {
 
 function checkInfraSpaceSecurityOwnership() {
   const problems = []
-  const securityRoot = 'crates/uc-infra/src/space/security'
+  // Engine issue #144 S2：这组实现从 crates/uc-infra-profile/src/space/security
+  // 整体搬进独立的 uc-infra-security crate；history_signature.rs 和
+  // mls_group.rs 随 OpenMLS 引擎一起搬进 uc-infra-crypto。
+  const securityRoot = 'crates/uc-infra-security/src'
   const requiredEntries = [
-    'mod.rs',
+    'lib.rs',
     'access.rs',
-    'history_signature.rs',
     'key_material.rs',
     'membership_update.rs',
-    'mls_group.rs',
     'scope_identifier.rs',
     'session.rs',
     'session_rebind.rs',
   ]
+  const cryptoRoot = 'crates/uc-infra-crypto/src'
+  const requiredCryptoEntries = ['history_signature.rs', 'mls_group.rs']
   const retiredEntries = [
-    'crates/uc-infra/src/security/adapters/space_session_rebind.rs',
-    'crates/uc-infra/src/security/admission_security_transition.rs',
-    'crates/uc-infra/src/security/historical_signature_adapter.rs',
-    'crates/uc-infra/src/security/key_material.rs',
-    'crates/uc-infra/src/security/membership_security_update_adapter.rs',
-    'crates/uc-infra/src/security/mls_group.rs',
-    'crates/uc-infra/src/security/peer_admission_adapter.rs',
-    'crates/uc-infra/src/space/security/peer_admission.rs',
-    'crates/uc-infra/src/security/scope_identifier.rs',
-    'crates/uc-infra/src/security/session.rs',
-    'crates/uc-infra/src/security/space_access_adapter.rs',
+    'crates/uc-infra-profile/src/security/adapters/space_session_rebind.rs',
+    'crates/uc-infra-profile/src/security/admission_security_transition.rs',
+    'crates/uc-infra-profile/src/security/historical_signature_adapter.rs',
+    'crates/uc-infra-profile/src/security/key_material.rs',
+    'crates/uc-infra-profile/src/security/membership_security_update_adapter.rs',
+    'crates/uc-infra-profile/src/security/mls_group.rs',
+    'crates/uc-infra-profile/src/security/peer_admission_adapter.rs',
+    'crates/uc-infra-profile/src/space/security/peer_admission.rs',
+    'crates/uc-infra-profile/src/security/scope_identifier.rs',
+    'crates/uc-infra-profile/src/security/session.rs',
+    'crates/uc-infra-profile/src/security/space_access_adapter.rs',
+    'crates/uc-infra-profile/src/space/security',
   ]
 
   for (const entry of requiredEntries) {
@@ -1531,6 +1580,15 @@ function checkInfraSpaceSecurityOwnership() {
         problems,
         'infra space security ownership',
         `missing Space security implementation: ${securityRoot}/${entry}`
+      )
+    }
+  }
+  for (const entry of requiredCryptoEntries) {
+    if (!existsSync(join(REPOSITORY_ROOT, cryptoRoot, entry))) {
+      addProblem(
+        problems,
+        'infra space security ownership',
+        `missing Space security crypto implementation: ${cryptoRoot}/${entry}`
       )
     }
   }
@@ -1576,7 +1634,7 @@ function checkSecureStorageBlockingOwnership(sources) {
 
 function checkRetiredLegacySpaceTransition(sources) {
   const problems = []
-  const legacyPath = 'crates/uc-infra/src/security/admission_space_transition.rs'
+  const legacyPath = 'crates/uc-infra-profile/src/security/admission_space_transition.rs'
   if (sources.legacySpaceTransitionPathPresent) {
     addProblem(
       problems,
@@ -2147,8 +2205,29 @@ function checkMembershipHistoryOwnership(sources) {
   return problems
 }
 
+// CI、测试脚本与 nextest 配置按包名选择测试；包改名或删除后旧名字只会让过滤静默落空。
+function packageSelectorSources() {
+  const files = execFileSync(
+    'git',
+    ['ls-files', '--', '.github', 'scripts', '.config/nextest.toml'],
+    { cwd: REPOSITORY_ROOT, encoding: 'utf8' },
+  )
+    .split('\n')
+    // 本检查自身含有负面用例文本，不作为选择器来源。
+    .filter(path => /\.(ya?ml|sh|mjs|toml)$/.test(path) && path !== 'scripts/architecture/check-engine-repository.mjs')
+  return files.map(path => ({ path, text: read(path) }))
+}
+
 function repositorySources() {
   return {
+    packageSelectors: packageSelectorSources(),
+    blobLocalCapability: read('crates/uc-core/src/ports/blob/transfer.rs'),
+    blobBusinessProduction: [
+      productionSources('crates/uc-core/src', [], true),
+      productionSources('crates/uc-application/src', [], true),
+    ].join('\n'),
+    blobNativeProduction: productionSources('crates/uc-infra-p2p/src', [], true),
+    blobRouterBridge: read('crates/uc-infra-p2p/src/network/iroh/blob_exchange/handler.rs'),
     monolithicMembershipHistoryPresent: existsSync(join(REPOSITORY_ROOT, 'crates/uc-core/src/membership/versioned_membership_history.rs')),
     membershipHistoryRoot: read('crates/uc-core/src/membership/versioned_membership_history/mod.rs'),
     membershipHistoryCore: readSourceTree('crates/uc-core/src/membership/versioned_membership_history'),
@@ -2162,45 +2241,48 @@ function repositorySources() {
         'crates/uc-application/src/space/membership/owner.rs',
         'crates/uc-application/src/space/membership/ports.rs',
       ]),
-      productionSources('crates/uc-infra/src'),
+      productionSources('crates/uc-infra-profile/src'),
       productionSources('crates/uc-engine/src'),
       readSourceTree('bindings'),
     ].join('\n'),
-    membershipRecordInfraOutsideCodec: productionSources('crates/uc-infra/src', [
-      'crates/uc-infra/src/space/membership_record/codec.rs',
-      ...readdirSync(join(REPOSITORY_ROOT, 'crates/uc-infra/src/space/membership_record/codec')).map(
-        name => `crates/uc-infra/src/space/membership_record/codec/${name}`
+    membershipRecordInfraOutsideCodec: productionSources('crates/uc-infra-profile/src', [
+      'crates/uc-infra-profile/src/space/membership_record/codec.rs',
+      ...readdirSync(join(REPOSITORY_ROOT, 'crates/uc-infra-profile/src/space/membership_record/codec')).map(
+        name => `crates/uc-infra-profile/src/space/membership_record/codec/${name}`
       ),
-      'crates/uc-infra/src/space/membership_record/test_support.rs',
+      'crates/uc-infra-profile/src/space/membership_record/test_support.rs',
     ]),
     membershipEvidenceOwner: read('crates/uc-application/src/space/membership/reconcile_history_evidence/use_case.rs'),
     retiredMembershipPersistencePathPresent: [
-      'crates/uc-infra/src/db/repositories/membership_candidate_repo.rs',
-      'crates/uc-infra/src/db/repositories/membership_announcement_repo.rs',
-      'crates/uc-infra/src/db/repositories/membership_outbox_repo.rs',
-      'crates/uc-infra/src/db/repositories/membership_applied_security_update_repo.rs',
+      'crates/uc-infra-profile/src/db/repositories/membership_candidate_repo.rs',
+      'crates/uc-infra-profile/src/db/repositories/membership_announcement_repo.rs',
+      'crates/uc-infra-profile/src/db/repositories/membership_outbox_repo.rs',
+      'crates/uc-infra-profile/src/db/repositories/membership_applied_security_update_repo.rs',
     ].some(path => existsSync(join(REPOSITORY_ROOT, path))),
     membershipPersistence: [
       read('crates/uc-core/src/membership/ports.rs'),
       read('crates/uc-core/src/membership/error.rs'),
       read('crates/uc-core/src/membership/mod.rs'),
-      read('crates/uc-infra/src/db/repositories/mod.rs'),
-      read('crates/uc-infra/src/db/repositories/relationship_store.rs'),
+      read('crates/uc-infra-storage/src/db/repositories/mod.rs'),
+      read('crates/uc-infra-storage/src/db/repositories/relationship_store.rs'),
     ].join('\n'),
     irohPeerAddressResolver: read(
-      'crates/uc-infra/src/network/iroh/peer_address_resolver.rs'
+      'crates/uc-infra-p2p/src/network/iroh/peer_address_resolver.rs'
     ),
     irohAddressConsumers: [
-      'clipboard_dispatch_adapter.rs',
+      'connectivity/backend.rs',
       'connection_channel_adapter.rs',
       'group_update_adapter.rs',
       'membership_branch_recovery_adapter.rs',
       'membership_history_exchange_adapter.rs',
       'peer_reachability_adapter.rs',
       'transfer_progress_adapter.rs',
-      'active_clipboard/dispatch_adapter.rs',
-      'active_clipboard/pull_client_adapter.rs',
-    ].map(path => read(`crates/uc-infra/src/network/iroh/${path}`)).join('\n'),
+    ].map(path => read(`crates/uc-infra-p2p/src/network/iroh/${path}`)).join('\n'),
+    presenceTransport: productionSources('crates/uc-application/src/space/connectivity/peer_connections/transport'),
+    presenceBridge: read('crates/uc-infra-p2p/src/network/iroh/connectivity/presence_handler.rs'),
+    retiredPresencePresent: ['peer_reachability_adapter/liveness.rs', 'peer_reachability_protocol.rs'].some(path => existsSync(join(REPOSITORY_ROOT, 'crates/uc-infra-p2p/src/network/iroh', path))),
+    activeClipboardTransport: productionSources('crates/uc-application/src/clipboard/active/transport'),
+    activeClipboardInfra: productionSources('crates/uc-infra-p2p/src/network/iroh/active_clipboard', ['crates/uc-infra-p2p/src/network/iroh/active_clipboard/testing.rs'], true),
     runtimeModule: read('crates/uc-engine/src/runtime/mod.rs'),
     sessionSupervisor: read('crates/uc-engine/src/runtime/session_supervisor.rs'),
     runtimeLifecycleModule: read('crates/uc-application/src/runtime_lifecycle/mod.rs'),
@@ -2208,19 +2290,19 @@ function repositorySources() {
     runtimeLifecycleCoordinator: read(
       'crates/uc-application/src/runtime_lifecycle/coordinator.rs'
     ),
-    spaceAccess: read('crates/uc-infra/src/space/security/access.rs'),
-    configMigration: read('crates/uc-infra/src/config_migration/mod.rs'),
+    spaceAccess: read('crates/uc-infra-security/src/access.rs'),
+    configMigration: read('crates/uc-infra-profile/src/config_migration/mod.rs'),
     engineSpaceAccessWiring: read('crates/uc-engine/src/assembly/wire/infra.rs'),
     legacySpaceTransitionPathPresent: existsSync(
-      join(REPOSITORY_ROOT, 'crates/uc-infra/src/security/admission_space_transition.rs')
+      join(REPOSITORY_ROOT, 'crates/uc-infra-profile/src/security/admission_space_transition.rs')
     ),
-    infraSecurityModule: read('crates/uc-infra/src/security/mod.rs'),
-    infraSecurityRuntime: readSourceTree('crates/uc-infra/src/security'),
-    secureStorageAccess: read('crates/uc-infra/src/security/secure_storage_access.rs'),
+    infraSecurityModule: read('crates/uc-infra-profile/src/security/mod.rs'),
+    infraSecurityRuntime: readSourceTree('crates/uc-infra-profile/src/security'),
+    secureStorageAccess: read('crates/uc-infra-security/src/secure_storage_access.rs'),
     profileContentVaultKeyStore: read(
-      'crates/uc-infra/src/security/profile_content_key_vault/key_store.rs'
+      'crates/uc-infra-security/src/profile_content_key_vault/key_store.rs'
     ),
-    spaceKeyMaterial: read('crates/uc-infra/src/space/security/key_material.rs'),
+    spaceKeyMaterial: read('crates/uc-infra-security/src/key_material.rs'),
     runtimeStorage: read('crates/uc-engine/src/assembly/runtime_storage.rs'),
     observabilityModule: read('crates/uc-engine/src/assembly/observability/mod.rs'),
     engineObservability: readSourceTree('crates/uc-engine/src/assembly/observability'),
@@ -2249,9 +2331,9 @@ function repositorySources() {
     ),
     spaceAdapters: read('crates/uc-application/src/space/adapters.rs'),
     spaceApplication: read('crates/uc-application/src/space/application.rs'),
-    network: readSourceTree('crates/uc-infra/src/network'),
+    network: readSourceTree('crates/uc-infra-p2p/src/network'),
     v3AdmissionTransition: read(
-      'crates/uc-infra/src/security/v3_admission_space_transition.rs'
+      'crates/uc-infra-profile/src/security/v3_admission_space_transition.rs'
     ),
     uniffi: read('bindings/uc-engine-uniffi/src/lib.rs'),
     ohos: read('bindings/uc-ohos-napi/src/lib.rs'),
@@ -2268,9 +2350,58 @@ function repositorySources() {
   }
 }
 
+// 当前状态与 pull 的完整流程只能消费通用连接；原生 bridge 不能自行拨号或编排半流。
+function checkActiveClipboardTransportOwnership(sources) {
+  const problems = []
+  if (/\b(?:use\s+iroh|iroh::|Endpoint)\b/.test(sources.activeClipboardTransport))
+    problems.push('active clipboard Application transport must remain backend independent')
+  if (/\.(?:connect|open_bi|accept_bi)\s*\(/.test(sources.activeClipboardInfra))
+    problems.push('active clipboard native bridge must delegate complete exchanges to Application')
+  if (/ActiveClipboardPullServePort/.test(sources.core))
+    problems.push('retired active clipboard Core serve port must not return')
+  return problems
+}
+
+// presence 的业务表和完整交换只能由 backend 无关的 Application owner 管理。
+function checkPresenceOwnership(sources) {
+  const problems = []
+  if (/\b(?:iroh::|Endpoint|RecvStream|SendStream)\b/.test(sources.presenceTransport))
+    problems.push('presence Application transport must remain backend independent')
+  if (/\.(?:connect|open_bi|accept_bi)\s*\(|HashMap|ReachabilityState/.test(sources.presenceBridge))
+    problems.push('presence Router bridge must hand over the complete connection')
+  if (sources.retiredPresencePresent)
+    problems.push('retired native presence workflow or IO codec must not return')
+  return problems
+}
+
+// blob网络工作只经过通用租约；本地发布端口不能重新获得获取或对端取消能力。
+function checkBlobTransferOwnership(metadata, sources) {
+  const problems = []
+  // 依赖元数据使用真实包名，重命名不能把原生传输带入业务层；测试依赖不受此生产约束。
+  for (const owner of ['uc-core', 'uc-application']) {
+    for (const dependency of normalDependencies(packageByName(metadata, owner))) {
+      if (/^iroh(?:-|$)/.test(dependency.name))
+        problems.push(`${owner} must not depend on native Iroh transport: ${dependency.name}`)
+    }
+  }
+  const businessCode = sources.blobBusinessProduction.replace(/^\s*\/\/.*$/gm, '')
+  if (/\biroh(?:_blobs)?\s*::/.test(businessCode))
+    problems.push('blob Core and Application code must remain backend independent')
+  if (/async\s+fn\s+(?:fetch|fetch_to_path|shutdown_inflight_fetch)\b/.test(sources.blobLocalCapability))
+    problems.push('retired blob fetch or peer-wide cancellation capability must not return')
+  if (/\bDownloader\b|\.downloader\s*\(/.test(sources.blobNativeProduction))
+    problems.push('production blob transfers must not create an SDK Downloader or its connection pool')
+  if (/\bshutdown_endpoint\b/.test(sources.blobNativeProduction))
+    problems.push('blob cancellation must not close a peer connection')
+  if (/\bBlobsProtocol\b/.test(sources.blobNativeProduction) || /\.(?:connect|open_bi|accept_bi)\s*\(/.test(sources.blobRouterBridge))
+    problems.push('blob Router must delegate the complete connection to the Application owner')
+  return problems
+}
+
 function collectProblems(metadata, sources, { includePlaintext = true } = {}) {
   return [
     ...checkWorkspaceShape(metadata),
+    ...checkPackageSelectors(metadata, sources),
     ...checkOpenMlsValidation(metadata),
     ...checkLocalDependencies(metadata),
     ...checkTestkitBoundary(metadata),
@@ -2294,6 +2425,9 @@ function collectProblems(metadata, sources, { includePlaintext = true } = {}) {
     ...checkRetiredLegacySpaceTransition(sources),
     ...checkRetiredMembershipPersistence(sources),
     ...checkIrohPeerAddressResolution(sources),
+    ...checkActiveClipboardTransportOwnership(sources),
+    ...checkPresenceOwnership(sources),
+    ...checkBlobTransferOwnership(metadata, sources),
     ...checkSessionSupervisorOwnership(sources),
     ...checkRuntimeLifecycleOwnership(sources),
     ...checkSpaceAccessConstructionModes(sources),
@@ -2321,6 +2455,78 @@ function expectRejected(name, mutate, metadata, sources) {
 }
 
 function runNegativeFixtures(metadata, sources) {
+  for (const [consumer, names] of Object.entries(NETWORK_STACK_CONSUMERS)) {
+    for (const name of names) {
+      expectRejected(`${consumer} registry network dependency ${name}`, changed => {
+        const dependency = packageByName(changed, consumer).dependencies.find(dep => dep.name === name)
+        delete dependency.path
+        dependency.source = 'registry+https://github.com/rust-lang/crates.io-index'
+      }, metadata, sources)
+    }
+  }
+
+  // 原生 bridge 的源码保留在实际基线；业务层的显式测试依赖也仍可用于测试夹具。
+  const fixtureMetadata = clone(metadata)
+  for (const owner of ['uc-core', 'uc-application']) {
+    packageByName(fixtureMetadata, owner).dependencies.push({
+      name: 'iroh', rename: 'native_fixture', kind: 'dev', optional: false,
+    })
+  }
+  if (checkBlobTransferOwnership(fixtureMetadata, sources).length !== 0)
+    throw new Error('blob test dependencies and the native bridge must remain allowed')
+  process.stdout.write('OK blob test dependencies and native bridge allowed\n')
+  expectRejected('blob native Application endpoint', (_metadata, changed) => {
+    changed.blobBusinessProduction += '\nuse iroh::Endpoint;\n'
+  }, metadata, sources)
+  expectRejected('blob native Core connection alias', (_metadata, changed) => {
+    changed.blobBusinessProduction += '\npub type NativeConnection = iroh::endpoint::Connection;\n'
+  }, metadata, sources)
+  expectRejected('blob native Application SDK import', (_metadata, changed) => {
+    changed.blobBusinessProduction += '\nuse iroh_blobs::get::fsm;\n'
+  }, metadata, sources)
+  for (const owner of ['uc-core', 'uc-application']) {
+    for (const dependency of ['iroh', 'iroh-blobs']) {
+      expectRejected(`blob renamed native dependency in ${owner}: ${dependency}`, changed => {
+        packageByName(changed, owner).dependencies.push({
+          name: dependency,
+          rename: 'native_transport',
+          kind: null,
+          optional: false,
+        })
+      }, metadata, sources)
+    }
+  }
+  expectRejected('retired blob fetch capability', (_metadata, changed) => {
+    changed.blobLocalCapability += '\nasync fn fetch_to_path() {}\n'
+  }, metadata, sources)
+  expectRejected('blob SDK self-dialing pool', (_metadata, changed) => {
+    changed.blobNativeProduction += '\nlet downloader = store.downloader(endpoint);\n'
+  }, metadata, sources)
+  expectRejected('blob peer-wide cancellation', (_metadata, changed) => {
+    changed.blobNativeProduction += '\nasync fn cancel() { pool.shutdown_endpoint(peer).await; }\n'
+  }, metadata, sources)
+  expectRejected('blob raw provider handler', (_metadata, changed) => {
+    changed.blobNativeProduction += '\nlet handler = BlobsProtocol::new(store, None);\n'
+  }, metadata, sources)
+  expectRejected('blob bridge stream workflow', (_metadata, changed) => {
+    changed.blobRouterBridge += '\nasync fn bypass() { connection.accept_bi().await; }\n'
+  }, metadata, sources)
+  expectRejected('presence native workflow bypass', (_metadata, changed) => {
+    changed.presenceBridge += '\nasync fn bypass() { connection.accept_bi().await; }\n'
+  }, metadata, sources)
+  expectRejected('presence native Application dependency', (_metadata, changed) => {
+    changed.presenceTransport += '\nuse iroh::Endpoint;\n'
+  }, metadata, sources)
+  expectRejected('retired native presence implementation', (_metadata, changed) => {
+    changed.retiredPresencePresent = true
+  }, metadata, sources)
+  expectRejected('active clipboard native dialing bypass', (_metadata, changed) => {
+    changed.activeClipboardInfra += '\nasync fn bypass() { endpoint.connect(peer, alpn).await; }\n'
+  }, metadata, sources)
+  expectRejected('active clipboard native Application dependency', (_metadata, changed) => {
+    changed.activeClipboardTransport += '\nuse iroh::Endpoint;\n'
+  }, metadata, sources)
+
   expectRejected('membership workflow returned to Core', (_metadata, changed) => {
     changed.membershipHistoryCore += '\nasync fn reconcile_evidence() {}\n'
   }, metadata, sources)
@@ -2329,6 +2535,12 @@ function runNegativeFixtures(metadata, sources) {
   }, metadata, sources)
   expectRejected('public membership history implementation modules', (_metadata, changed) => {
     changed.membershipHistoryRoot += '\npub mod archive;\n'
+  }, metadata, sources)
+  expectRejected('test selector naming a removed package', (_metadata, changed) => {
+    changed.packageSelectors = [
+      ...changed.packageSelectors,
+      { path: 'scripts/testing/fixture.sh', text: "cargo nextest run -p uc-infra -E 'package(uc-infra)'\n" },
+    ]
   }, metadata, sources)
   expectRejected('repository-external local dependency', changed => {
     packageByName(changed, 'uc-engine').dependencies.push({
@@ -2473,6 +2685,7 @@ function main() {
   if (realpathSync(process.cwd()) !== REPOSITORY_ROOT) {
     throw new Error(`run from repository root: ${REPOSITORY_ROOT}`)
   }
+  execFileSync('node', ['scripts/architecture/check-network-stack.mjs'], { cwd: REPOSITORY_ROOT, stdio: 'inherit' })
   runCargoBuildStorageCheck()
   runRustStyleCheck()
   const metadata = cargoMetadata()

@@ -154,6 +154,15 @@ pub struct SpaceAdmissionSponsorRejected {
     pub(super) abandonment_cleanup: Option<SponsorAbandonmentCleanup>,
 }
 
+/// 早于尝试期限格式写入的邀请方记录被收尾后的终态。
+///
+/// 旧记录没有 CompleteAck 或 Settled 回复这类证据，因此不能表达成 `Completed` 或 `Rejected`。
+/// 账本里没有成员时 `confirmation` 为空；成员已经提交时为 `Unconfirmed`，表示对端确认无法再被证实。
+#[derive(PartialEq, Eq)]
+pub struct SpaceAdmissionSponsorLegacyClosed {
+    pub(super) confirmation: Option<SponsorPairingConfirmationSummary>,
+}
+
 #[derive(PartialEq, Eq)]
 pub struct SpaceAdmissionSponsorExpired {
     pub(super) abandonment_cleanup: SponsorAbandonmentCleanup,
@@ -259,6 +268,8 @@ pub struct SpaceAdmissionSupersededTerminal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpaceAdmissionRecoveryRequiredTerminal {
     pub(super) category: AdmissionRecoveryCategory,
+    /// 从发生转换时的 Joiner 状态捕获；旧格式只保存类别，重新打开时为 `None`。
+    pub(super) join_id: Option<JoinId>,
 }
 
 #[cfg(test)]

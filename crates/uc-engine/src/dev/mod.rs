@@ -16,14 +16,22 @@ mod space_work;
 
 pub(crate) use admission_settlement::{GatedJoinerActivation, JoinerFinalConfirmationGate};
 pub(crate) use space_work::{
-    ControlledSpaceAdmissionTransport, RecordedGroupUpdateDispatch,
-    RecordedMembershipHistoryExchange, SpaceWorkTestControl,
+    ControlledSpaceAdmissionTransport, FaultableGroupUpdateReceiver, FaultableGroupUpdateWire,
+    GatedMembershipHistoryEndpoint, RecordedGroupUpdateDispatch, RecordedMembershipHistoryExchange,
+    SpaceWorkTestControl,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DevMembershipHistoryFailure {
     Retryable,
     NeedsAttention,
+}
+
+/// 接收方应用组密钥更新时可注入的、可恢复的本地失败。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DevGroupUpdateReceiveFault {
+    NotReady,
+    StorageUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +46,15 @@ pub enum DevSpaceWorkEventKind {
     MembershipHistorySyncRetryableFailure,
     MembershipHistorySyncNeedsAttention,
     MembershipHistorySyncReplyReceived,
+    GroupUpdateReceiveFaultInjected,
+    GroupUpdateApplied,
+    GroupUpdateMissingPredecessorObserved,
+    GroupUpdateTampered,
+    GroupUpdateCurrentWireSent,
+    GroupUpdateLegacyWireSent,
+    GroupUpdateCurrentWireAcknowledged,
+    GroupUpdateLegacyWireAcknowledged,
+    LegacyReceiverRejectionInjected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +245,23 @@ pub enum DevOperation {
         count: usize,
     },
     ClearMembershipHistoryFailures,
+    /// 阻止正确后缀/证据抵达，保留摘要联系；释放后走真实历史应用。
+    SetMembershipHistoryHeld {
+        held: bool,
+        peer: Option<String>,
+    },
+    /// 持续让本机作为接收方的组密钥更新应用以指定的本地失败结束，直到传入 `None`。
+    SetGroupUpdateReceiveFault {
+        fault: Option<DevGroupUpdateReceiveFault>,
+    },
+    /// 让本机作为发送方的后续 `count` 次组密钥更新在线上被篡改（保存的原件不变）。
+    ArmGroupUpdateTamper {
+        count: usize,
+    },
+    /// 让本机作为发送方的后续 `count` 次组密钥更新直接得到旧协议接收方式的无原因拒绝，不联系接收方。
+    ArmLegacyReceiverRejection {
+        count: usize,
+    },
     WaitForSpaceWorkEvent {
         after_sequence: u64,
         kind: DevSpaceWorkEventKind,
@@ -243,6 +277,9 @@ pub enum DevOperation {
     RejectNewConnections {
         endpoint_ids: Vec<[u8; 32]>,
         peer_reachability: bool,
+    },
+    RejectInboundPeerReachability {
+        endpoint_ids: Vec<[u8; 32]>,
     },
     QueryRejectedConnectionCount,
     QueryPeerReachabilityConnections,
@@ -275,12 +312,17 @@ impl fmt::Debug for DevOperation {
             }
             Self::ArmMembershipHistoryFailures { .. } => "arm_membership_history_failures",
             Self::ClearMembershipHistoryFailures => "clear_membership_history_failures",
+            Self::SetGroupUpdateReceiveFault { .. } => "set_group_update_receive_fault",
+            Self::SetMembershipHistoryHeld { .. } => "set_membership_history_held",
+            Self::ArmGroupUpdateTamper { .. } => "arm_group_update_tamper",
+            Self::ArmLegacyReceiverRejection { .. } => "arm_legacy_receiver_rejection",
             Self::WaitForSpaceWorkEvent { .. } => "wait_for_space_work_event",
             Self::QuerySpaceWorkEvents => "query_space_work_events",
             Self::FailNextSessionHandover { .. } => "fail_next_session_handover",
             Self::QuerySessionHandoverDiagnostics => "query_session_handover_diagnostics",
             Self::SetNetworkPartition { .. } => "set_network_partition",
             Self::RejectNewConnections { .. } => "reject_new_connections",
+            Self::RejectInboundPeerReachability { .. } => "reject_inbound_peer_reachability",
             Self::QueryRejectedConnectionCount => "query_rejected_connection_count",
             Self::QueryPeerReachabilityConnections => "query_peer_reachability_connections",
             Self::RetainOnePeerReachabilityConnection => "retain_one_peer_reachability_connection",
@@ -427,6 +469,10 @@ pub enum DevOperationResult {
     MembershipHistoryFailuresCleared {
         remaining: usize,
     },
+    GroupUpdateReceiveFaultSet,
+    GroupUpdateTamperArmed,
+    MembershipHistoryHoldSet,
+    LegacyReceiverRejectionArmed,
     SpaceWorkEvent(DevSpaceWorkEvent),
     SpaceWorkEvents(Vec<DevSpaceWorkEvent>),
     SessionHandoverFailureArmed,
@@ -477,6 +523,10 @@ impl fmt::Debug for DevOperationResult {
             }
             Self::MembershipHistoryFailuresArmed { .. } => "membership_history_failures_armed",
             Self::MembershipHistoryFailuresCleared { .. } => "membership_history_failures_cleared",
+            Self::GroupUpdateReceiveFaultSet => "group_update_receive_fault_set",
+            Self::MembershipHistoryHoldSet => "membership_history_hold_set",
+            Self::GroupUpdateTamperArmed => "group_update_tamper_armed",
+            Self::LegacyReceiverRejectionArmed => "legacy_receiver_rejection_armed",
             Self::SpaceWorkEvent(_) => "space_work_event",
             Self::SpaceWorkEvents(_) => "space_work_events",
             Self::SessionHandoverFailureArmed => "session_handover_failure_armed",

@@ -9,12 +9,14 @@ mod event;
 mod file_display_metadata;
 mod file_set;
 mod hash;
+mod history_tag;
 pub mod integration_mode;
 pub mod link_utils;
 mod mime;
 mod origin;
 mod payload_availability;
 mod policy;
+mod receive_deletion;
 mod repository_error;
 mod selection;
 mod snapshot;
@@ -42,6 +44,7 @@ pub use file_set::{
 };
 pub use policy::ClipboardSelection;
 pub use policy::*;
+pub use receive_deletion::{check_receive_deletion, ReceiveDeletionRefusal};
 pub use repository_error::ClipboardRepositoryError;
 pub use selection::*;
 pub use snapshot::*;
@@ -53,6 +56,10 @@ pub use system::{
 
 pub use decision::{ClipboardContentActionDecision, DuplicationHint, RejectReason};
 pub use hash::{ContentHash, HashAlgorithm};
+pub use history_tag::{
+    HistoryTagName, HistoryTagNameError, HISTORY_TAG_MAX_BATCH_ENTRIES, HISTORY_TAG_MAX_COUNT,
+    HISTORY_TAG_MAX_MERGE_SOURCES, HISTORY_TAG_NAME_MAX_CHARS,
+};
 pub use integration_mode::ClipboardIntegrationMode;
 pub use mime::{normalize_wire_mime, ImageKind, MimeClass, MimeType};
 pub use origin::ClipboardOrigin;

@@ -1,13 +1,13 @@
 # ADR-029：CI 编译缓存使用 Cloudflare R2
 
-- **状态**：已采纳（R2 凭据配置与实测见“未验证项”）
+- **状态**：已被 [ADR-033](033-unified-mbx-rust-builds.md) 取代；下文保留历史决定（R2 凭据配置与实测见“未验证项”）
 - **日期**：2026-09-28
 - **范围**：经 `.github/actions/rust-ci-setup` 的 CI Rust job（`pr-check.yml`、`engine-real-environment.yml`）
   与手工基准 `compile-cache-benchmark.yml`；不改变发布工作流、本地构建与 [ADR-028](028-optional-mbx-build-cache.md) 的 mbx 入口
 - **相关文件**：[`rust-ci-setup`](../../../.github/actions/rust-ci-setup/action.yml)、
-  [`start-ci-sccache.sh`](../../../scripts/build-cache/start-ci-sccache.sh)、
-  [`measure-ci-sccache.mjs`](../../../scripts/build-cache/measure-ci-sccache.mjs)、
-  [`ci-compile-cache.test.mjs`](../../../scripts/build-cache/ci-compile-cache.test.mjs)
+  `scripts/build-cache/start-ci-sccache.sh`（历史实现，已移除）、
+  `scripts/build-cache/measure-ci-sccache.mjs`（历史实现，已移除）、
+  `scripts/build-cache/ci-compile-cache.test.mjs`（历史实现，已移除）
 
 ## 背景
 
@@ -78,7 +78,7 @@ CI 原先用 sccache 的 GitHub Actions 缓存后端（`SCCACHE_GHA_ENABLED=true
 | 条目损坏 | sccache 读不出的条目按未命中重编；系统性问题通过代际号整体失效 |
 | 多个 job 并发写同一键 | 同一键内容由同一输入决定，后写覆盖先写，结果等价 |
 | 跨平台 | 键含编译器与目标三元组，且前缀按 os-arch 分开，不会命中其他平台的产物 |
-| 覆盖率插桩 | `-C instrument-coverage` 与 `uc-infra` profile 覆盖都进入参数哈希，与普通构建分开存储 |
+| 覆盖率插桩 | `-C instrument-coverage` 与 `uc-infra-*` profile 覆盖都进入参数哈希，与普通构建分开存储 |
 
 sccache 只在存储读探测通过后才监听端口，脚本据此判断就绪，并再以 `--show-stats` 的缓存位置核对后端类型；
 报告的后端（`UC_COMPILE_CACHE_BACKEND` 与 step summary）总是正在监听的那个服务。
@@ -128,3 +128,11 @@ R2 令牌在 Cloudflare 仪表盘 → R2 → Manage API tokens 以 Account API t
 - 升级 sccache 时同时更新 action 的 `version` 与脚本中的版本号和二进制 sha256，并重跑基准。
 - 收益必须以 `compile-cache-benchmark.yml` 在同一提交、同一 runner 类别上的冷/暖对照为准；缓存只减少可缓存的
   rustc 编译，链接、build script、proc-macro 与测试执行不受影响，不承诺固定加速。
+
+## MBX 共用桶补充（2026-10-07）
+
+本决定记录历史 CI sccache 路线的格式、命名空间与凭据装配；当前仓库统一 MBX 方案见
+[ADR-033](033-unified-mbx-rust-builds.md)。MBX R2 流程使用
+`engine/mbx/v1/`，只共用桶与 GitHub 读写环境，不共用 sccache 条目。主线 MBX 发布还要求真实受保护
+分支 push；本机与 PR 为只读。完整接入与验收规则只在[本地构建指南](../local-builds.md#r2-分布式动作缓存)维护。
+为 `engine/mbx/` 配置独立对象过期规则并确认容量；不得覆盖现有 sccache 生命周期规则。

@@ -5,7 +5,8 @@ use crate::error_codes::*;
 use base64::Engine as _;
 
 use uc_application::facade::{
-    AppFacade, ContentTypesPatch as AppContentTypesPatch, CurrentJoinStatus, DeviceTrustMembership,
+    AppFacade, ContentTypesPatch as AppContentTypesPatch, CurrentJoinStatus, DeviceGroupUpdate,
+    DeviceGroupUpdateRecovery, DeviceGroupUpdateState, DeviceTrustMembership,
     DeviceTrustRelationship, DeviceTrustStatus, DeviceTrustSyncState, InboundPairingStatus,
     JoinSpaceTerminationReason, MemberProtectionStatusView,
     MemberSyncPreferencesPatch as AppMemberSyncPreferencesPatch, MemberSyncPreferencesView,
@@ -16,17 +17,19 @@ use uc_core::ports::ReachabilityState;
 
 use crate::{
     ContentTypesPatch, ContentTypesSummary, DeviceCompatibilitySummary,
-    DeviceGroupRelationshipSummary, DeviceMembershipSummary, DeviceReachabilitySummary,
-    DeviceSummary, DeviceSyncRelationshipSummary, DeviceTrustChangeSummary,
-    DeviceTrustChoiceSummary, DeviceTrustImpactSummary, DeviceTrustRecoverySummary,
-    DeviceTrustRelationshipSummary, DeviceTrustSnapshotSummary, EngineError, EngineErrorCategory,
-    InboundPairingStatusSummary, InboundPairingSummary, JoinSpaceAttentionReasonSummary,
-    JoinSpaceAttentionRecoverySummary, JoinSpaceRejectionReasonSummary, JoinSpaceStatusSummary,
-    JoinSpaceTerminationReasonSummary, JoinedSpaceSummary, MemberProtectionStatusSummary,
-    MemberProtectionSummary, MemberSyncPreferencesPatch, MemberSyncPreferencesSummary,
-    OperationResult, PairingConfirmationSummary, PendingInboundMemberSummary,
-    QueryMemberSyncPreferencesInput, RemoveMemberInput, SpaceProtectionModeSummary,
-    SpaceProtectionSummary, UpdateMemberSyncPreferencesInput,
+    DeviceGroupRelationshipSummary, DeviceGroupUpdateRecoverySummary,
+    DeviceGroupUpdateStateSummary, DeviceGroupUpdateSummary, DeviceMembershipSummary,
+    DeviceReachabilitySummary, DeviceSummary, DeviceSyncRelationshipSummary,
+    DeviceTrustChangeSummary, DeviceTrustChoiceSummary, DeviceTrustImpactSummary,
+    DeviceTrustRecoverySummary, DeviceTrustRelationshipSummary, DeviceTrustSnapshotSummary,
+    EngineError, EngineErrorCategory, InboundPairingStatusSummary, InboundPairingSummary,
+    JoinSpaceAttentionReasonSummary, JoinSpaceAttentionRecoverySummary,
+    JoinSpaceRejectionReasonSummary, JoinSpaceStatusSummary, JoinSpaceTerminationReasonSummary,
+    JoinedSpaceSummary, MemberProtectionStatusSummary, MemberProtectionSummary,
+    MemberSyncPreferencesPatch, MemberSyncPreferencesSummary, OperationResult,
+    PairingConfirmationSummary, PendingInboundMemberSummary, QueryMemberSyncPreferencesInput,
+    RemoveMemberInput, SpaceProtectionModeSummary, SpaceProtectionSummary,
+    UpdateMemberSyncPreferencesInput,
 };
 use uc_observability_contract::{log_fields::log_vocab, uc_error, uc_info};
 
@@ -261,6 +264,7 @@ pub(crate) fn device_trust_snapshot(snapshot: DeviceTrustStatus) -> DeviceTrustS
                     }
                     PairingConfirmationStatus::Confirmed => PairingConfirmationSummary::Confirmed,
                 }),
+                group_update: device.group_update.map(group_update_summary),
                 available_actions: Vec::new(),
                 blocked_reason: None,
             })
@@ -269,6 +273,35 @@ pub(crate) fn device_trust_snapshot(snapshot: DeviceTrustStatus) -> DeviceTrustS
         allowed_actions: Vec::new(),
         blocked_reason: None,
         updated_at_ms: 0,
+    }
+}
+
+fn group_update_summary(update: DeviceGroupUpdate) -> DeviceGroupUpdateSummary {
+    let recovery = match update.state.recovery() {
+        DeviceGroupUpdateRecovery::Automatic => DeviceGroupUpdateRecoverySummary::Automatic,
+        DeviceGroupUpdateRecovery::AutomaticOnReconnect => {
+            DeviceGroupUpdateRecoverySummary::AutomaticOnReconnect
+        }
+        DeviceGroupUpdateRecovery::ReviewDevice => DeviceGroupUpdateRecoverySummary::ReviewDevice,
+    };
+    DeviceGroupUpdateSummary {
+        epoch: update.epoch,
+        state: match update.state {
+            DeviceGroupUpdateState::Waiting => DeviceGroupUpdateStateSummary::Waiting,
+            DeviceGroupUpdateState::ReceiverUnavailable => {
+                DeviceGroupUpdateStateSummary::ReceiverUnavailable
+            }
+            DeviceGroupUpdateState::RejectedUnclassified => {
+                DeviceGroupUpdateStateSummary::RejectedUnclassified
+            }
+            DeviceGroupUpdateState::RejectedByReceiver => {
+                DeviceGroupUpdateStateSummary::RejectedByReceiver
+            }
+        },
+        recovery,
+        attempts: update.attempts,
+        next_retry_at_ms: (recovery == DeviceGroupUpdateRecoverySummary::Automatic)
+            .then_some(update.next_attempt_at_ms),
     }
 }
 
@@ -368,10 +401,16 @@ pub(crate) fn join_space_status(status: CurrentJoinStatus) -> JoinSpaceStatusSum
                 uc_application::facade::JoinSpaceAttentionReason::OutcomeCannotBeProven => {
                     JoinSpaceAttentionReasonSummary::OutcomeCannotBeProven
                 }
+                uc_application::facade::JoinSpaceAttentionReason::ContinuationUnavailable => {
+                    JoinSpaceAttentionReasonSummary::ContinuationUnavailable
+                }
             },
             recovery: match recovery {
                 uc_application::facade::JoinSpaceAttentionRecovery::PreserveDataAndContactSupport => {
                     JoinSpaceAttentionRecoverySummary::PreserveDataAndContactSupport
+                }
+                uc_application::facade::JoinSpaceAttentionRecovery::RestartWithNewInvitation => {
+                    JoinSpaceAttentionRecoverySummary::RestartWithNewInvitation
                 }
             },
             next_retry_at_ms,
@@ -384,6 +423,9 @@ pub(crate) fn join_space_status(status: CurrentJoinStatus) -> JoinSpaceStatusSum
                 }
                 uc_core::membership::SpaceAdmissionRejectionReason::AuthenticationRejected => {
                     JoinSpaceRejectionReasonSummary::AuthenticationRejected
+                }
+                uc_core::membership::SpaceAdmissionRejectionReason::SponsorUnresponsive => {
+                    JoinSpaceRejectionReasonSummary::SponsorUnresponsive
                 }
                 uc_core::membership::SpaceAdmissionRejectionReason::IdentityConflict => {
                     JoinSpaceRejectionReasonSummary::IdentityConflict
@@ -764,6 +806,7 @@ mod tests {
                         DeviceTrustSyncState::Usable
                     },
                     pairing_confirmation: None,
+                    group_update: None,
                 })
                 .collect(),
         }

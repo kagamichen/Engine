@@ -4,6 +4,11 @@
 //! numeric value because callers always interpret an error in the context of
 //! the operation they submitted.
 
+/// `Engine::start`：宿主声明的附加配置文件名不合规、重复或与 Engine 自有文件重名。
+pub const HOST_CONFIGURATION_FILES_INVALID_CODE: u32 = 1109;
+/// `Engine::start`：宿主声明的日志档位名称不合规。
+pub const HOST_LOG_PROFILE_INVALID_CODE: u32 = 1110;
+
 pub const CREATE_SPACE_PASSPHRASE_MISMATCH_CODE: u32 = 1201;
 pub const CREATE_SPACE_ALREADY_INITIALIZED_CODE: u32 = 1202;
 pub const CREATE_SPACE_FAILED_CODE: u32 = 1203;
@@ -128,11 +133,14 @@ pub const HISTORY_INVALID_INPUT_CODE: u32 = 1401;
 pub const HISTORY_NOT_FOUND_CODE: u32 = 1402;
 pub const HISTORY_UNSUPPORTED_CONTENT_CODE: u32 = 1403;
 pub const HISTORY_FAILED_CODE: u32 = 1404;
+/// 加密会话未解锁，历史标签操作失败关闭。
+pub const HISTORY_TAGS_LOCKED_CODE: u32 = 1405;
+/// 当前 profile 尚未升级到可加密保存标签名称的存储格式。
+pub const HISTORY_TAGS_UNAVAILABLE_CODE: u32 = 1406;
 pub const QUERY_UPGRADE_STATUS_FAILED_CODE: u32 = 1401;
 pub const ACKNOWLEDGE_UPGRADE_FAILED_CODE: u32 = 1402;
 
 pub const QUERY_DIAGNOSTICS_FAILED_CODE: u32 = 1411;
-pub const UPDATE_DEBUG_MODE_FAILED_CODE: u32 = 1412;
 pub const EXPORT_DIAGNOSTIC_LOGS_FAILED_CODE: u32 = 1413;
 pub const EXPORT_DIAGNOSTIC_LOGS_INVALID_TARGET_CODE: u32 = 1414;
 pub const EXPORT_DIAGNOSTIC_LOGS_UNAUTHORIZED_CODE: u32 = 1415;
@@ -215,6 +223,14 @@ mod tests {
                 FACTORY_RESET_RESTART_REQUIRED_CODE,
             ],
             &[
+                HISTORY_INVALID_INPUT_CODE,
+                HISTORY_NOT_FOUND_CODE,
+                HISTORY_UNSUPPORTED_CONTENT_CODE,
+                HISTORY_FAILED_CODE,
+                HISTORY_TAGS_LOCKED_CODE,
+                HISTORY_TAGS_UNAVAILABLE_CODE,
+            ],
+            &[
                 PROFILE_RECOVERY_REQUIRED_CODE,
                 PROFILE_RECOVERY_PARTIAL_CODE,
                 PROFILE_RECOVERY_UNSUPPORTED_CODE,
@@ -281,7 +297,6 @@ mod tests {
             ],
             &[
                 QUERY_DIAGNOSTICS_FAILED_CODE,
-                UPDATE_DEBUG_MODE_FAILED_CODE,
                 EXPORT_DIAGNOSTIC_LOGS_FAILED_CODE,
                 EXPORT_DIAGNOSTIC_LOGS_INVALID_TARGET_CODE,
                 EXPORT_DIAGNOSTIC_LOGS_UNAUTHORIZED_CODE,

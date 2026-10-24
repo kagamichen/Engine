@@ -31,4 +31,9 @@ Thumbs.db
 # PR Lens 的预览产物，按需重新生成。
 .pr-lens/
 
+# Python 校验生成的字节码不是源码。
 __pycache__/
+*.pyc
+
+# 本地任务计划、排障记录和验收工件不纳入源码提交。
+/.planning/

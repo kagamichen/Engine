@@ -28,7 +28,7 @@
 //! postcard does not natively describe "arbitrary bytes followed by more
 //! arbitrary bytes with a terminator." Explicit length prefixes are
 //! simpler, testable in isolation, and align with the pairing wire codec's
-//! length-prefixed framing (see `uc-infra/src/pairing/wire.rs`).
+//! length-prefixed framing (see `uc-infra-p2p/src/pairing/wire.rs`).
 //!
 //! ## Stream I/O
 //!
@@ -36,6 +36,11 @@
 //! AsyncWrite`. iroh's `SendStream` / `RecvStream` already satisfy those
 //! bounds so the adapter hands raw stream halves in; the tests here use
 //! [`tokio::io::duplex`] bidirectional pipes for the same contract.
+
+/// 原有单交换剪贴板协议；帧和应用确认语义保持。
+pub const CLIPBOARD_ALPN: &[u8] = b"uniclipboard/clipboard-applied/1";
+/// 明确承诺同连接独立多流交换；不改变帧或 ACK。
+pub const MULTIPLEXED_CLIPBOARD_ALPN: &[u8] = b"uniclipboard/clipboard-applied/2";
 
 use std::convert::TryFrom;
 

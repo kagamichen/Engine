@@ -15,6 +15,19 @@ pub async fn execute(engine: &Engine, command: &str, request: &Value) -> Result<
             };
             Ok(json!(endpoint_id))
         }
+        "set_network_partition" => {
+            let blocked_endpoint_ids = serde_json::from_value(request["endpoint_ids"].clone())
+                .context("invalid endpoint identifiers")?;
+            let DevOperationResult::NetworkPartitionUpdated { blocked_peer_count } = engine
+                .execute_dev(DevOperation::SetNetworkPartition {
+                    blocked_endpoint_ids,
+                })
+                .await?
+            else {
+                bail!("partition result expected")
+            };
+            Ok(json!({"blocked_peer_count": blocked_peer_count}))
+        }
         "reject_reachability_dials" => {
             let endpoint_ids = serde_json::from_value(request["endpoint_ids"].clone())
                 .context("invalid endpoint identifiers")?;
@@ -26,6 +39,18 @@ pub async fn execute(engine: &Engine, command: &str, request: &Value) -> Result<
                 .await?
             else {
                 bail!("connection rejection result expected");
+            };
+            Ok(json!({ "blocked_peer_count": blocked_peer_count }))
+        }
+        #[cfg(feature = "inbound-network-faults")]
+        "reject_inbound_presence" => {
+            let endpoint_ids = serde_json::from_value(request["endpoint_ids"].clone())
+                .context("invalid endpoint identifiers")?;
+            let DevOperationResult::NetworkPartitionUpdated { blocked_peer_count } = engine
+                .execute_dev(DevOperation::RejectInboundPeerReachability { endpoint_ids })
+                .await?
+            else {
+                bail!("incoming rejection result expected");
             };
             Ok(json!({ "blocked_peer_count": blocked_peer_count }))
         }

@@ -9,7 +9,7 @@ async function main() {
 
   const addon = require(addonPath);
   require('./declaration_contract.cjs').assertDeclaredMethods(addon);
-  assert.equal(addon.coreVersion(), 'v1.1.0-rc.22');
+  assert.equal(addon.coreVersion(), 'v1.1.0-rc.23');
   assert.equal(typeof addon.installProcessObservability, 'function');
   assert.equal(typeof addon.queryProcessObservabilityHealth, 'function');
   assert.equal(typeof addon.flushProcessObservability, 'function');

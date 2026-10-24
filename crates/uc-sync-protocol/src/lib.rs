@@ -3,14 +3,19 @@
 //! 本 crate 只包含帧结构、版本与 magic 常量、大小上限以及基于
 //! `AsyncRead` / `AsyncWrite` 的编解码，不包含拨号、重试、准入判断、密钥、
 //! 存储或任何传输库类型。流程负责人仍在 `uc-application`，传输适配器在
-//! `uc-infra`。
+//! `uc-infra-profile`/`uc-infra-p2p`。
 
 pub mod active_clipboard_pull;
 pub mod active_clipboard_state;
 pub mod clipboard;
+pub mod full_invitation;
+pub mod group_update;
 pub mod membership_branch_recovery;
+pub mod membership_history;
 pub mod space_admission;
 pub mod trace_context;
 pub mod transfer_progress;
 
 pub use trace_context::{WireTraceContext, TRACEPARENT_MAX_BYTES};
+
+pub mod peer_reachability;

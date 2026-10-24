@@ -1,3 +1,6 @@
+#[cfg(all(test, feature = "dev-tools"))]
+mod blob_source_authorization;
+mod census;
 mod dispatch;
 mod file_export;
 mod host_clipboard;
@@ -52,7 +55,7 @@ const OPERATION_UNAVAILABLE_CODE: u32 = 1103;
 
 pub(crate) struct ProductionRuntime {
     app_version: String,
-    security_lifecycle: Arc<uc_infra::space::RuntimeSpaceAccessAdapter>,
+    security_lifecycle: Arc<uc_infra_profile::space::RuntimeSpaceAccessAdapter>,
     session_supervisor: Arc<SessionSupervisor>,
     profile_reset: Arc<ProfileFactoryResetFacade>,
     network_recovery: Arc<uc_application::facade::NetworkRecoveryFacade>,
@@ -69,13 +72,13 @@ pub(crate) struct ProductionRuntime {
     clipboard_change_runtime: HostClipboardChangeRuntime,
     events: EventSender,
     #[cfg(feature = "dev-tools")]
-    network_partition_gate: uc_infra::network::iroh::IrohNetworkPartitionGate,
+    network_partition_gate: uc_infra_p2p::network::iroh::IrohNetworkPartitionGate,
     #[cfg(feature = "dev-tools")]
     joiner_final_confirmation_gate: Arc<JoinerFinalConfirmationGate>,
 }
 
 // 启动过程中还没有 ProductionRuntime；失败或取消也要封口已有安全会话。
-struct StartupSecurityGuard(Option<Arc<uc_infra::space::RuntimeSpaceAccessAdapter>>);
+struct StartupSecurityGuard(Option<Arc<uc_infra_profile::space::RuntimeSpaceAccessAdapter>>);
 impl Drop for StartupSecurityGuard {
     fn drop(&mut self) {
         if let Some(access) = &self.0 {
@@ -164,16 +167,21 @@ impl ProductionRuntime {
         paths: uc_core::app_dirs::AppPaths,
         events: EventSender,
         progress: Arc<crate::engine::startup::StartupProgressStore>,
-        profile_key_recovery: Arc<uc_infra::security::ProfileKeyRecoveryStore>,
+        profile_key_recovery: Arc<uc_infra_profile::security::ProfileKeyRecoveryStore>,
     ) -> Result<Self, EngineError> {
         let app_version = config.app_version().to_string();
         let rendezvous_base_url = config.rendezvous_base_url_override();
         let relay_fallback_override = config.test_relay_fallback_override();
         let iroh_bind_port_override = config.test_iroh_bind_port_override();
         #[cfg(feature = "dev-tools")]
-        let network_partition_gate = uc_infra::network::iroh::IrohNetworkPartitionGate::default();
+        let network_partition_gate =
+            uc_infra_p2p::network::iroh::IrohNetworkPartitionGate::default();
         #[cfg(feature = "dev-tools")]
         let joiner_final_confirmation_gate = Arc::new(JoinerFinalConfirmationGate::default());
+        #[cfg(feature = "dev-tools")]
+        joiner_final_confirmation_gate
+            .space_work_control()
+            .set_legacy_group_protocol(config.uses_test_legacy_group_updates());
         let emitter = Arc::new(EngineHostEventEmitter::new(events.clone()));
         let wiring = wire_host_capabilities_with_emitter(
             &config,
@@ -203,8 +211,10 @@ impl ProductionRuntime {
         let analytics = Arc::clone(&wired.sync_engine.analytics_facade);
         let mut security_guard = StartupSecurityGuard(Some(Arc::clone(&security_lifecycle)));
         let host_adapters = wired.application.host_adapters();
-        let session_supervisor =
-            SessionSupervisor::new(wired.application.clone(), Arc::clone(&security_lifecycle));
+        let session_supervisor = SessionSupervisor::new(
+            wired.application.clone(),
+            Arc::clone(&wired.sync_engine.local_resources),
+        );
         let task_registry = Arc::new(TaskRegistry::new());
         let profile_runtime = Arc::new(shutdown::ProfileRuntimeStopper::new(
             Arc::clone(&security_lifecycle),
@@ -282,6 +292,7 @@ impl ProductionRuntime {
         .await;
         spawn_network_recovery_events(network_recovery.subscribe(), &task_registry, events.clone())
             .await;
+        census::spawn_runtime_census(&task_registry).await;
         let clipboard_change_runtime = HostClipboardChangeRuntime {
             session_supervisor: Arc::clone(&session_supervisor),
             system_clipboard: Arc::clone(&host_adapters.system_clipboard),
@@ -420,9 +431,12 @@ fn startup_error(
     uc_error!(
         context = context,
         io_error_kind = io_kind,
+        error = &error as &dyn std::error::Error,
         "engine startup failed"
     );
-    if error_chain_contains::<uc_infra::security::ProfileUpgradeBackupRecordKeyMissing>(&error) {
+    if error_chain_contains::<uc_infra_profile::security::ProfileUpgradeBackupRecordKeyMissing>(
+        &error,
+    ) {
         return EngineError::new(
             PROFILE_UPGRADE_BACKUP_KEY_MISSING_CODE,
             EngineErrorCategory::Unavailable,
@@ -524,7 +538,7 @@ mod tests {
     fn missing_upgrade_backup_key_has_a_stable_non_retryable_startup_result() {
         let error = startup_error(
             "dependency wiring",
-            uc_infra::security::ProfileUpgradeBackupRecordKeyMissing,
+            uc_infra_profile::security::ProfileUpgradeBackupRecordKeyMissing,
         );
         assert_eq!(
             error.code(),

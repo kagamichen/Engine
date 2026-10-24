@@ -3,9 +3,22 @@ use super::{
     connection::peer_context, emit_local, millis, record::LocalEvent, ConnectionCloseReason,
     ConnectionDirection, NetworkRecorder, ObservationContext,
 };
+use crate::wire_enum;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::time::Instant;
+
+wire_enum! {
+    serde
+    /// 只记录已协商的固定协议种类，不接受任意 ALPN 文本。
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    pub enum NegotiatedProtocol {
+        PeerReachabilityV1 => "peer_reachability_v1",
+        PeerReachabilityV2 => "peer_reachability_v2",
+        Blob => "blob",
+        Other => "other",
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +54,9 @@ pub(super) enum PhysicalEvent {
         direction: ConnectionDirection,
         initial_path: NetworkPathKind,
     },
+    Negotiated {
+        protocol: NegotiatedProtocol,
+    },
     Closed {
         direction: ConnectionDirection,
         reason: ConnectionCloseReason,
@@ -65,6 +81,7 @@ impl PhysicalEvent {
     pub(super) fn name(&self) -> &'static str {
         match self {
             Self::Established { .. } => "connection.established",
+            Self::Negotiated { .. } => "connection.protocol.negotiated",
             Self::Closed { .. } => "connection.closed",
             Self::Path { .. } => "connection.path.observed",
             Self::Lagged { .. } => "connection.path.lagged",
@@ -160,20 +177,17 @@ impl NetworkRecorder {
         );
         observation
     }
-    pub fn connection_observer_unavailable(&self, peer: [u8; 32], reason: ObserverFailure) {
-        let context = peer_context(peer);
-        tracing::dispatcher::with_default(&self.dispatcher, || {
-            emit_local(
-                LocalEvent::Physical {
-                    record: PhysicalEvent::Unavailable { reason },
-                },
-                &context,
-            )
-        });
-    }
 }
 
 impl ConnectionLifetimeObservation {
+    pub fn negotiated(&self, protocol: NegotiatedProtocol) {
+        self.emit(PhysicalEvent::Negotiated { protocol }, None);
+    }
+    /// 观察任务未能登记时保留同一连接关联，不伪造完整关闭观察。
+    pub fn unavailable(mut self, reason: ObserverFailure) {
+        self.finished = true;
+        self.emit(PhysicalEvent::Unavailable { reason }, None);
+    }
     pub fn path(
         &self,
         key: [u8; 32],

@@ -12,15 +12,17 @@ use uc_core::blob::ports::{BlobContentIngestPort, BlobReaderPort, BlobWriterPort
 use uc_core::ids::ProfileId;
 use uc_core::ports::clipboard::ClipboardRepresentationNormalizerPort;
 use uc_core::ports::*;
-use uc_infra::blob::{
+use uc_infra_content::clipboard::ClipboardRepresentationNormalizer;
+use uc_infra_content::config::ClipboardStorageConfig;
+use uc_infra_local::blob::{
     BlobRepositoryPort, BlobStorePort, BlobWriter, SwitchableFilesystemBlobStore,
 };
-use uc_infra::clipboard::ClipboardRepresentationNormalizer;
-use uc_infra::config::ClipboardStorageConfig;
-use uc_infra::device::LocalDeviceIdentity;
-use uc_infra::search::V3SearchProtection;
-use uc_infra::security::{ContentProtection, ProfileContentKeyVault, ProfilePayloadAdapters};
-use uc_infra::space::InMemorySession;
+use uc_infra_local::device::LocalDeviceIdentity;
+use uc_infra_profile::security::{
+    ContentProtection, ProfileContentKeyVault, ProfilePayloadAdapters,
+};
+use uc_infra_profile::space::InMemorySession;
+use uc_infra_storage::search::V3SearchProtection;
 use uc_observability_contract::{error_source::io_error_kind, uc_info, uc_warn};
 
 /// 已由启动 manifest/gate 选择的 profile primary payload 格式。
@@ -97,7 +99,7 @@ pub struct PlatformLayer {
     /// 所有 profile persistence adapter 共用的唯一版本选择。
     pub(crate) payload_runtime: ProfilePayloadRuntime,
 
-    // 进程内会话——uc-infra 内部 adapter (SpaceAccessAdapter / BlobCipherAdapter /
+    // 进程内会话——uc-infra-security / uc-infra-content 的 adapter (SpaceAccessAdapter / BlobCipherAdapter /
     // TransferCipherAdapter / EncryptedBlobStore) 共享同一份 Arc。具体类型,
     // 不再走 EncryptionSessionPort trait dyn 间接层。
     pub session: Arc<InMemorySession>,
@@ -220,7 +222,7 @@ pub fn create_platform_layer(
     let representation_normalizer: Arc<dyn ClipboardRepresentationNormalizerPort> =
         Arc::new(ClipboardRepresentationNormalizer::new(storage_config));
 
-    // 进程内会话: uc-infra adapter 共享的具体类型,替换历史
+    // 进程内会话: uc-infra-security 提供、各 Infra adapter 共享的具体类型,替换历史
     // InMemoryEncryptionSessionPort + EncryptionSessionPort trait dyn 间接层。
     let session = Arc::new(InMemorySession::new());
 
@@ -283,9 +285,7 @@ pub fn create_platform_layer(
 pub fn current_profile_for(
     profile_id: impl Into<ProfileId>,
 ) -> Arc<dyn uc_core::ports::security::current_profile::CurrentProfilePort> {
-    Arc::new(uc_infra::security::DefaultCurrentProfile::for_profile(
-        profile_id.into(),
-    ))
+    Arc::new(uc_infra_profile::security::DefaultCurrentProfile::for_profile(profile_id.into()))
 }
 
 /// Check if a file starts with the UCBL binary format magic bytes.

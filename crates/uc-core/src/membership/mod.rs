@@ -6,6 +6,7 @@ mod admission_content_key_catalog;
 mod bootstrap;
 mod cross_space_transition;
 mod error;
+mod group_update_retry;
 mod ledger;
 mod member;
 mod member_instance;
@@ -49,10 +50,11 @@ pub use cross_space_transition::{
     SAME_SPACE_TRANSITION_FORMAT_V1,
 };
 pub use error::{
-    CurrentMembershipIdentityError, GroupUpdateDispatchError, MembershipError,
-    MembershipHistoryExchangeError, MembershipInitializationError, RelationshipStateResetError,
-    SpaceSecurityStateResetError,
+    CurrentMembershipIdentityError, GroupUpdateDispatchError, GroupUpdateRejection,
+    MembershipError, MembershipHistoryExchangeError, MembershipInitializationError,
+    RelationshipStateResetError, SpaceSecurityStateResetError,
 };
+pub use group_update_retry::GroupUpdateRetryPolicy;
 pub use ledger::{
     DepartingLink, DepartingLinkSnapshot, LedgerDeliveryKind, LedgerDeliveryResult,
     LedgerDeviceView, LedgerEffect, LedgerFollowUp, LedgerInput, LedgerMemberStatus, LedgerOutcome,
@@ -88,7 +90,7 @@ pub use membership_history::{
     MembershipHistorySuffixRequestV3, MembershipHistorySummaryV3, RemovalDecision,
 };
 pub use ports::{
-    BeginRevocationOutcome, ContentExchangeGatePort, CurrentMembershipAnnouncementMaterial,
+    BeginRevocationOutcome, CurrentMembershipAnnouncementMaterial,
     CurrentMembershipAnnouncementPort, CurrentMembershipIdentity, CurrentMembershipIdentityPort,
     GroupRevocationPort, GroupUpdateDispatchPort, MemberRepositoryPort,
     MembershipAdmissionDecision, MembershipHistoryExchangeEndpointPort,
@@ -102,10 +104,11 @@ pub use protection::{
 };
 pub use revocation::{
     AdmissionReplayId, ContentKeyId, ContentKeyPurpose, GroupEpoch, GroupRevocationResult,
-    GroupUpdateDeliveryStatus, KeyEpochError, KeyEpochStateIssue, PendingGroupUpdate,
-    PreparedRevocationResolution, ProtectionGroupAdmission, ProtectionGroupId, RevocationId,
-    RevocationOutboxMessage, RevocationRecord, RevocationStage, RevocationStatus, SpaceKeyMaterial,
-    SpaceKeyState, SpaceSecurityMode,
+    GroupUpdateDeliveryCondition, GroupUpdateDeliveryStatus, GroupUpdateRecipientDelivery,
+    KeyEpochError, KeyEpochStateIssue, PendingGroupUpdate, PreparedRevocationResolution,
+    ProtectionGroupAdmission, ProtectionGroupId, RevocationId, RevocationOutboxMessage,
+    RevocationRecord, RevocationStage, RevocationStatus, SpaceKeyMaterial, SpaceKeyState,
+    SpaceSecurityMode,
 };
 pub use settlement_window::{SettlementWindow, SettlementWindowState};
 pub use space_admission::{
@@ -132,15 +135,16 @@ pub use space_admission::{
     AdmissionSpaceTransitionResult, AdmissionStagedSecurityState, AdmissionStagedTarget,
     AdmissionStagedTargetInput, InvitationId, JoinId, JoinerActivationPreparation, JoinerAdmission,
     JoinerAdmissionTransition, JoinerAppliedPreparation, JoinerCandidatePreparation,
-    JoinerCompletePreparation, JoinerInvitationResolution, PendingAdmissionExchange,
-    SpaceAdmissionAggregate, SpaceAdmissionAggregateError, SpaceAdmissionBodyV1,
-    SpaceAdmissionEnvelopeHeaderV1, SpaceAdmissionEnvelopeV1, SpaceAdmissionId,
-    SpaceAdmissionMessageKind, SpaceAdmissionPersistenceError, SpaceAdmissionProtocolVersion,
-    SpaceAdmissionRejectionReason, SpaceAdmissionRoute, SpaceAdmissionTerminationReason,
-    SponsorAbandonmentCleanup, SponsorAdmission, SponsorAdmissionTransition,
-    SponsorCandidatePreparation, SponsorCommitPreparation, SponsorCompletePreparation,
-    SponsorPairingConfirmationStatus, SponsorPairingConfirmationSummary,
-    SponsorSettlementPreparation, StartedJoinerInvitationResolution, UnreadableHistoryPolicy,
+    JoinerCompletePreparation, JoinerInvitationResolution, LegacySponsorMemberQuery,
+    LegacySponsorMembership, PendingAdmissionExchange, SpaceAdmissionAggregate,
+    SpaceAdmissionAggregateError, SpaceAdmissionBodyV1, SpaceAdmissionEnvelopeHeaderV1,
+    SpaceAdmissionEnvelopeV1, SpaceAdmissionId, SpaceAdmissionMessageKind,
+    SpaceAdmissionPersistenceError, SpaceAdmissionProtocolVersion, SpaceAdmissionRejectionReason,
+    SpaceAdmissionRoute, SpaceAdmissionTerminationReason, SponsorAbandonmentCleanup,
+    SponsorAdmission, SponsorAdmissionTransition, SponsorCandidatePreparation,
+    SponsorCommitPreparation, SponsorCompletePreparation, SponsorPairingConfirmationStatus,
+    SponsorPairingConfirmationSummary, SponsorRecordStage, SponsorSettlementPreparation,
+    StartedJoinerInvitationResolution, UnreadableHistoryPolicy,
     SPACE_ADMISSION_ATTEMPT_DURATION_MS, SPACE_ADMISSION_RECORD_FORMAT_V1,
     SPACE_ADMISSION_RECORD_FORMAT_V2,
 };

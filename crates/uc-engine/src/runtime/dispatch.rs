@@ -4,6 +4,13 @@ use crate::{
     DevOperationResult,
 };
 use tokio::time::Instant;
+#[cfg(feature = "dev-tools")]
+use uc_core::ids::DeviceId;
+#[cfg(feature = "dev-tools")]
+use uc_infra_p2p::network::iroh::{
+    CLIPBOARD_ALPN, LEGACY_PEER_REACHABILITY_ALPN, MULTIPLEXED_CLIPBOARD_ALPN,
+    PEER_REACHABILITY_ALPN,
+};
 
 #[cfg(feature = "dev-tools")]
 use super::operation_error_with_code;
@@ -29,6 +36,7 @@ use crate::operations::history::history::{
 use crate::operations::history::receive::{
     execute_cancel_entry_receive, execute_cancel_inbound_transfer,
     execute_list_entry_receive_progress, execute_query_entry_receive_progress,
+    execute_retry_entry_receive,
 };
 use crate::operations::history::resend::execute_resend_entry;
 use crate::operations::history::resource::{
@@ -39,11 +47,16 @@ use crate::operations::history::search::{
     execute_query_search_tags, execute_rebuild_search_index, execute_search_entries,
     history_page_result, history_search_input, map_query_history_error,
 };
+use crate::operations::history::tags::{
+    execute_add_history_tag_to_entries, execute_create_history_tag, execute_delete_history_tag,
+    execute_list_history_tags, execute_merge_history_tags, execute_remove_history_tag_from_entries,
+    execute_rename_history_tag, execute_summarize_history_entry_tags,
+};
 use crate::operations::settings::config_migration::{
     execute_export_config, execute_preview_config_import, execute_stage_config_import,
 };
 use crate::operations::settings::diagnostics::{
-    execute_export_diagnostic_logs, execute_query_diagnostics, execute_update_debug_mode,
+    execute_export_diagnostic_logs, execute_query_diagnostics,
 };
 use crate::operations::settings::encryption::{
     execute_lock_encryption, execute_query_encryption_state, execute_verify_secure_storage_access,
@@ -307,9 +320,6 @@ impl EngineRuntime for ProductionRuntime {
                 Operation::QueryDiagnostics => {
                     execute_query_diagnostics(self.current_facade().await?.as_ref()).await
                 }
-                Operation::UpdateDebugMode(input) => {
-                    execute_update_debug_mode(self.current_facade().await?.as_ref(), input).await
-                }
                 Operation::ExportDiagnosticLogs(input) => {
                     execute_export_diagnostic_logs(
                         self.current_facade().await?.as_ref(),
@@ -492,6 +502,39 @@ impl EngineRuntime for ProductionRuntime {
                     execute_set_history_entry_favorite(self.current_facade().await?.as_ref(), input)
                         .await
                 }
+                Operation::ListHistoryTags => {
+                    execute_list_history_tags(self.current_facade().await?.as_ref()).await
+                }
+                Operation::CreateHistoryTag(input) => {
+                    execute_create_history_tag(self.current_facade().await?.as_ref(), input).await
+                }
+                Operation::RenameHistoryTag(input) => {
+                    execute_rename_history_tag(self.current_facade().await?.as_ref(), input).await
+                }
+                Operation::AddHistoryTagToEntries(input) => {
+                    execute_add_history_tag_to_entries(self.current_facade().await?.as_ref(), input)
+                        .await
+                }
+                Operation::RemoveHistoryTagFromEntries(input) => {
+                    execute_remove_history_tag_from_entries(
+                        self.current_facade().await?.as_ref(),
+                        input,
+                    )
+                    .await
+                }
+                Operation::SummarizeHistoryEntryTags(input) => {
+                    execute_summarize_history_entry_tags(
+                        self.current_facade().await?.as_ref(),
+                        input,
+                    )
+                    .await
+                }
+                Operation::MergeHistoryTags(input) => {
+                    execute_merge_history_tags(self.current_facade().await?.as_ref(), input).await
+                }
+                Operation::DeleteHistoryTag(input) => {
+                    execute_delete_history_tag(self.current_facade().await?.as_ref(), input).await
+                }
                 Operation::QueryHistoryStats => {
                     execute_query_history_stats(self.current_facade().await?.as_ref()).await
                 }
@@ -523,6 +566,9 @@ impl EngineRuntime for ProductionRuntime {
                 }
                 Operation::ListEntryReceiveProgress => {
                     execute_list_entry_receive_progress(self.current_facade().await?.as_ref()).await
+                }
+                Operation::RetryEntryReceive(input) => {
+                    execute_retry_entry_receive(self.current_facade().await?.as_ref(), input).await
                 }
                 Operation::CancelEntryReceive(input) => {
                     execute_cancel_entry_receive(self.current_facade().await?.as_ref(), input).await
@@ -716,6 +762,7 @@ impl EngineRuntime for ProductionRuntime {
                 .current_facade()
                 .await?
                 .fetch_blob(FetchBlobCommand {
+                    cancellation: CancellationToken::new(),
                     ticket: BlobTicket::from_bytes(ticket),
                     entry_id: EntryId::from_string(entry_id),
                     transfer_context: None,
@@ -810,6 +857,41 @@ impl EngineRuntime for ProductionRuntime {
                     .clear_membership_history_failures();
                 Ok(DevOperationResult::MembershipHistoryFailuresCleared { remaining })
             }
+            DevOperation::SetGroupUpdateReceiveFault { fault } => {
+                self.joiner_final_confirmation_gate
+                    .space_work_control()
+                    .set_group_update_receive_fault(fault);
+                Ok(DevOperationResult::GroupUpdateReceiveFaultSet)
+            }
+            DevOperation::SetMembershipHistoryHeld { held, peer } => {
+                let peer = peer
+                    .map(|peer| {
+                        DeviceId::try_new(peer).ok_or_else(|| {
+                            operation_error_with_code(
+                                1912,
+                                "set history test gate",
+                                anyhow::anyhow!("invalid test peer"),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                self.joiner_final_confirmation_gate
+                    .space_work_control()
+                    .set_history_held(held, peer);
+                Ok(DevOperationResult::MembershipHistoryHoldSet)
+            }
+            DevOperation::ArmGroupUpdateTamper { count } => {
+                self.joiner_final_confirmation_gate
+                    .space_work_control()
+                    .arm_group_update_tamper(count);
+                Ok(DevOperationResult::GroupUpdateTamperArmed)
+            }
+            DevOperation::ArmLegacyReceiverRejection { count } => {
+                self.joiner_final_confirmation_gate
+                    .space_work_control()
+                    .arm_legacy_receiver_rejection(count);
+                Ok(DevOperationResult::LegacyReceiverRejectionArmed)
+            }
             DevOperation::WaitForSpaceWorkEvent {
                 after_sequence,
                 kind,
@@ -853,16 +935,27 @@ impl EngineRuntime for ProductionRuntime {
             } => {
                 let alpns = if peer_reachability {
                     vec![
-                        uc_infra::network::iroh::LEGACY_PEER_REACHABILITY_ALPN.to_vec(),
-                        uc_infra::network::iroh::PEER_REACHABILITY_ALPN.to_vec(),
+                        LEGACY_PEER_REACHABILITY_ALPN.to_vec(),
+                        PEER_REACHABILITY_ALPN.to_vec(),
                     ]
                 } else {
-                    vec![uc_infra::network::iroh::CLIPBOARD_ALPN.to_vec()]
+                    vec![MULTIPLEXED_CLIPBOARD_ALPN.to_vec(), CLIPBOARD_ALPN.to_vec()]
                 };
                 Ok(DevOperationResult::NetworkPartitionUpdated {
                     blocked_peer_count: self
                         .network_partition_gate
                         .reject_new_connections(endpoint_ids, alpns),
+                })
+            }
+            DevOperation::RejectInboundPeerReachability { endpoint_ids } => {
+                Ok(DevOperationResult::NetworkPartitionUpdated {
+                    blocked_peer_count: self.network_partition_gate.reject_incoming_connections(
+                        endpoint_ids,
+                        vec![
+                            LEGACY_PEER_REACHABILITY_ALPN.to_vec(),
+                            PEER_REACHABILITY_ALPN.to_vec(),
+                        ],
+                    ),
                 })
             }
             DevOperation::SuppressConnectivityOpportunities { suppressed } => {

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# 仓库 Cargo 入口；嵌套调用由 MBX 原生 shim 接管，先移除本入口避免递归。
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# 配置、统计与远端选择统一由原生包装器负责。
+exec bash "$root/scripts/build-cache/mbx.sh" --cargo "$@"

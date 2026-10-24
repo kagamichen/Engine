@@ -3,6 +3,7 @@
 //! Engine 只选择具体 adapter；本模块统一构造稳定 facade，并持有 Search、
 //! Clipboard 与历史维护的启动及完整关闭。
 
+use crate::clipboard::active::transport::ActivePullPreparationPort;
 use crate::clipboard::inbound::ClipboardReceiverPort;
 use std::sync::Arc;
 use tokio::time::Instant;
@@ -13,11 +14,10 @@ use uc_core::clipboard::ClipboardIntegrationMode;
 use uc_core::file_transfer::OutboundProgressReporterPort;
 use uc_core::ports::blob::{BlobReferenceRepositoryPort, BlobTransferPort};
 use uc_core::ports::{
-    ActiveClipboardDispatchPort, ActiveClipboardPullClientPort, ActiveClipboardPullServePort,
-    ActiveClipboardReceiverPort, CleanupDirectoryStagingPort, ClipboardDispatchPort,
-    ConnectionChannelPort, LocalIdentityPort, PairingInvitationAddressQueryPort,
-    PairingInvitationByAddressPort, PairingInvitationPort, PeerAddressRepositoryPort,
-    PeerReachabilityPort,
+    ActiveClipboardDispatchPort, ActiveClipboardPullClientPort, ActiveClipboardReceiverPort,
+    CleanupDirectoryStagingPort, ClipboardDispatchPort, ConnectionChannelPort, LocalIdentityPort,
+    PairingInvitationAddressQueryPort, PairingInvitationByAddressPort, PairingInvitationPort,
+    PeerAddressRepositoryPort, PeerReachabilityPort,
 };
 
 use crate::clipboard::active::ActiveClipboardLifecycleError;
@@ -38,7 +38,7 @@ use crate::facade::blob_transfer::BlobTransferFacade;
 use crate::facade::clipboard::facade::ClipboardSyncDeps;
 use crate::facade::clipboard::ClipboardSyncFacade;
 use crate::facade::clipboard_history::HistoryMaintenanceRuntime;
-use crate::facade::clipboard_write::RestoreBroadcastTrigger;
+use crate::facade::clipboard_write::restore_broadcast_channel;
 use crate::runtime_lifecycle::{
     LifecycleError, RuntimeLifecycle, RuntimeLifecycleParticipants, RuntimeLifecyclePort,
     TransitionContext,
@@ -51,8 +51,11 @@ use crate::space::{
     SpaceRuntimeAdapters, SpaceSessionDeps, SpaceTransitionDeps,
 };
 use crate::transfer::blob::facade::BlobTransferDeps;
+use crate::transfer::blob::transport::BlobDownloadResources;
 use crate::transfer::file::assembly::FileTransferAssembly;
-use crate::transfer::file::assembly::{FileTransferAssemblyDeps, ReceiveCancellationDeps};
+use crate::transfer::file::assembly::{
+    FileTransferAssemblyDeps, InboundMaterializerDeps, ReceiveActionsDeps,
+};
 use crate::transfer::file::timeout_runtime::FileTransferTimeoutRuntime;
 use crate::transfer::receive::reconciliation::EnsureReceiveReadyPort;
 
@@ -101,6 +104,7 @@ pub struct ApplicationClipboardAdapters {
 
 /// Engine 一次提交给 Application 的网络 adapter 集合。
 pub struct ApplicationNetworkAdapters {
+    pub blob_downloads: Arc<BlobDownloadResources>,
     pub blob_transfer: Arc<dyn BlobTransferPort>,
     pub blob_reference: Arc<dyn BlobReferenceRepositoryPort>,
     pub outbound_progress_reporter: Arc<dyn OutboundProgressReporterPort>,
@@ -131,7 +135,7 @@ pub struct ApplicationNetworkBinding {
     outbound_progress_reporter: Arc<dyn OutboundProgressReporterPort>,
     active_receiver: Arc<dyn ActiveClipboardReceiverPort>,
     active_dispatch: Arc<dyn ActiveClipboardDispatchPort>,
-    active_pull_serve: Arc<dyn ActiveClipboardPullServePort>,
+    active_pull_serve: Arc<dyn ActivePullPreparationPort>,
     active_pull_adapters: ClipboardInboundAdapters,
     is_unlocked: Arc<dyn crate::deps::IsSpaceUnlockedPort>,
 }
@@ -168,7 +172,7 @@ impl ApplicationNetworkBinding {
         Arc::clone(&self.member_scope)
     }
 
-    pub fn active_clipboard_pull_serve(&self) -> Arc<dyn ActiveClipboardPullServePort> {
+    pub fn active_clipboard_pull_preparation(&self) -> Arc<dyn ActivePullPreparationPort> {
         Arc::clone(&self.active_pull_serve)
     }
 
@@ -415,11 +419,13 @@ impl ApplicationAssembly {
         let ApplicationNetworkAdapters {
             blob_transfer,
             blob_reference,
+            blob_downloads,
             outbound_progress_reporter,
             space,
             clipboard,
         } = adapters;
         let blob = Arc::new(BlobTransferFacade::new(BlobTransferDeps {
+            downloads: blob_downloads,
             hash: Arc::clone(&self.deps.system.hash),
             blob_transfer: Arc::clone(&blob_transfer),
             blob_reference,
@@ -504,7 +510,7 @@ impl ApplicationAssembly {
             active_pull_hidden_marker,
             staging_cleanup,
         } = clipboard;
-        let clipboard_sync = Arc::new(self.file_transfer.with_receive_cancellation(
+        let clipboard_sync = Arc::new(self.file_transfer.with_receive_actions(
             ClipboardSyncFacade::new(ClipboardSyncDeps {
                 peer_addr_repo: Arc::clone(&peer_addresses),
                 member_repo: Arc::clone(&self.deps.device.member_repo),
@@ -525,7 +531,16 @@ impl ApplicationAssembly {
                 mobile_device_repo,
                 host_event_bus: Arc::clone(&self.deps.host_event_bus),
             }),
-            ReceiveCancellationDeps {
+            ReceiveActionsDeps {
+                retry: self.clipboard.receive_retry_deps(
+                    InboundMaterializerDeps {
+                        fetcher: blob.clone(),
+                        publisher: active_pull_publisher.clone(),
+                        target_reserver: active_pull_target_reserver.clone(),
+                        hidden_marker: active_pull_hidden_marker.clone(),
+                    },
+                    member_scope.clone(),
+                ),
                 staging_cleanup,
                 blob_transfer: Arc::clone(&blob),
             },
@@ -620,7 +635,7 @@ impl ApplicationAssembly {
                 });
             }
         };
-        let (restore_tx, restore_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (restore_tx, restore_rx) = restore_broadcast_channel();
         if let Err(source) = active_clipboard.attach_restore_broadcast(restore_rx) {
             let (active_clipboard_rollback, search_rollback, space_rollback) = tokio::join!(
                 active_clipboard.shutdown(),
@@ -674,10 +689,9 @@ impl ApplicationAssembly {
             inbound_events,
         });
         let settings = self.settings.clone().into_parts();
-        let clipboard_restore = self.clipboard.restore(
-            ClipboardIntegrationMode::Full,
-            Some(RestoreBroadcastTrigger::new(restore_tx)),
-        );
+        let clipboard_restore = self
+            .clipboard
+            .restore(ClipboardIntegrationMode::Full, Some(restore_tx));
         let facade = Arc::new(AppFacade::new(AppFacadeParts {
             space: Arc::clone(&space),
             probe_profile_key_access: Arc::new(

@@ -1,11 +1,11 @@
-//! SearchIndexPort — async trait implemented by uc-infra (Phase 91).
+//! SearchIndexPort——由 `uc-infra-storage` 实现的异步 trait（Phase 91）。
 //!
 //! All methods return Result<_, SearchError> to preserve typed error info
 //! across the port boundary (per D-03, D-04, D-05). Infra adapters may use
 //! anyhow::Error internally but MUST map to SearchError at method return.
 
 use crate::ids::EntryId;
-use crate::search::tag::SearchTagCount;
+use crate::search::tag::{SearchTagCount, TagId};
 use crate::search::{
     RebuildProgress, SearchDocument, SearchError, SearchIndexMeta, SearchPosting, SearchQuery,
     SearchResultsPage,
@@ -15,8 +15,8 @@ use tokio::sync::mpsc::Sender;
 
 /// Port for indexing and querying the local encrypted search index.
 ///
-/// Implemented by uc-infra (Phase 91). Injected as `Arc<dyn SearchIndexPort + Send + Sync>`
-/// into use cases and daemon state.
+/// 由 `uc-infra-storage` 实现（Phase 91），以 `Arc<dyn SearchIndexPort + Send + Sync>`
+/// 注入用例与 daemon 状态。
 #[async_trait]
 pub trait SearchIndexPort: Send + Sync {
     /// Index (insert or replace) a clipboard entry's document and its postings.
@@ -68,6 +68,20 @@ pub trait SearchIndexPort: Send + Sync {
         favorited: bool,
     ) -> Result<(), SearchError> {
         let _ = (entry_id, favorited);
+        Ok(())
+    }
+
+    /// 用条目当前的全部用户历史标签替换其在索引中的标签成员。
+    ///
+    /// 成员只以搜索密钥派生的不透明词项保存，不写入明文标签 id；条目尚未建立
+    /// 索引时为无操作，之后的索引写入会从权威关联补齐。不维护标签成员的适配器
+    /// 保留默认无操作实现。
+    async fn set_entry_history_tags(
+        &self,
+        entry_id: &EntryId,
+        tag_ids: &[TagId],
+    ) -> Result<(), SearchError> {
+        let _ = (entry_id, tag_ids);
         Ok(())
     }
 

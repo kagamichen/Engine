@@ -26,6 +26,7 @@ use uc_observability_contract::diagnostics::{
 };
 
 mod joiner_network;
+mod legacy_sponsor;
 
 #[derive(Clone, Copy)]
 enum RecoveryChannel {
@@ -177,6 +178,11 @@ impl AdmissionRecoveryService {
         }
         for loaded in sponsor_deadlines {
             let (aggregate, token) = loaded.into_parts();
+            if aggregate.is_legacy_unbounded() {
+                self.close_legacy_sponsor(aggregate, token, trigger, &mut report)
+                    .await;
+                continue;
+            }
             let transition = aggregate.terminate_if_expired(now_ms);
             match transition {
                 Ok(Some(transition)) => {
@@ -354,6 +360,15 @@ impl AdmissionRecoveryService {
                     aggregate,
                     token,
                     SpaceAdmissionRejectionReason::AuthenticationRejected,
+                )
+                .await;
+            }
+            (RecoveryChannel::Initial, SpaceAdmissionTransportError::SponsorUnresponsive) => {
+                self.save_initial_rejection(
+                    report,
+                    aggregate,
+                    token,
+                    SpaceAdmissionRejectionReason::SponsorUnresponsive,
                 )
                 .await;
             }
@@ -805,6 +820,7 @@ fn exchange_failure(error: &SpaceAdmissionTransportError) -> ExchangeFailure {
         }
         SpaceAdmissionTransportError::Unavailable { .. } => ExchangeFailure::Unavailable,
         SpaceAdmissionTransportError::Deferred { .. } => ExchangeFailure::Deferred,
+        SpaceAdmissionTransportError::SponsorUnresponsive => ExchangeFailure::SponsorUnresponsive,
         SpaceAdmissionTransportError::PeerUpgradeRequired => ExchangeFailure::PeerUpgradeRequired,
     }
 }
@@ -818,6 +834,9 @@ fn connection_decision(
         }
         (RecoveryChannel::Initial, SpaceAdmissionTransportError::InvitationUnavailable) => {
             RecoveryDecision::Rejected(Some(RejectionCause::InvitationUnavailable))
+        }
+        (RecoveryChannel::Initial, SpaceAdmissionTransportError::SponsorUnresponsive) => {
+            RecoveryDecision::Rejected(Some(RejectionCause::SponsorUnresponsive))
         }
         (RecoveryChannel::Initial, SpaceAdmissionTransportError::PeerUpgradeRequired) => {
             RecoveryDecision::Rejected(Some(RejectionCause::PeerUpgradeRequired))

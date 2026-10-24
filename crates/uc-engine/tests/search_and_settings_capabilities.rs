@@ -16,9 +16,9 @@ use uc_engine::{
     CountSearchEntriesInput, CreateSpaceInput, DailyEntryCountsInput, Engine, EngineConfig,
     EngineEvent, EventStream, GeneralSettingsPatch, HostCapabilities, HostCapabilityError,
     HostClipboard, HostClipboardSnapshot, HostDirectories, HostFileAccess, HostFileHandle,
-    HostFileMetadata, HostSecureStorage, Operation, OperationResult, QuickPanelPositionSummary,
-    QuickPanelSettingsPatch, SearchEntriesInput, SecretString, SendTextInput,
-    SetHistoryEntryFavoriteInput, SettingsPatch, SettingsSectionSummary, UnlockSpaceInput,
+    HostFileMetadata, HostSecureStorage, Operation, OperationResult, SearchEntriesInput,
+    SecretString, SendTextInput, SetHistoryEntryFavoriteInput, SettingsPatch,
+    SettingsSectionSummary, SyncSettingsPatch, UnlockSpaceInput,
 };
 
 const PASSPHRASE: &str = "quick-panel-capability-passphrase";
@@ -196,16 +196,29 @@ async fn counts(engine: &Engine, queries: Vec<SearchEntriesInput>) -> Vec<u32> {
 }
 
 async fn daily(engine: &Engine, boundaries_ms: Vec<i64>) -> Result<Vec<u32>, u32> {
-    match engine
-        .execute(Operation::QueryDailyEntryCounts(DailyEntryCountsInput {
-            boundaries_ms,
-        }))
-        .await
-    {
-        Ok(OperationResult::DailyEntryCounts(counts)) => Ok(counts),
-        Ok(other) => panic!("unexpected daily result: {other:?}"),
-        Err(error) => Err(error.code()),
+    // 与批量计数一致：解锁后的异步索引重建不代表统计语义失败。
+    // 只等待索引状态，锁定与非法输入仍立即返回，保留失败关闭断言。
+    let mut last = None;
+    for _ in 0..100 {
+        match engine
+            .execute(Operation::QueryDailyEntryCounts(DailyEntryCountsInput {
+                boundaries_ms: boundaries_ms.clone(),
+            }))
+            .await
+        {
+            Ok(OperationResult::DailyEntryCounts(counts)) => return Ok(counts),
+            Err(error)
+                if error.code() == SEARCH_INDEX_REBUILDING_CODE
+                    || error.code() == SEARCH_INDEX_NOT_READY_CODE =>
+            {
+                last = Some(error.code());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(other) => panic!("unexpected daily result: {other:?}"),
+            Err(error) => return Err(error.code()),
+        }
     }
+    panic!("index stayed unavailable for daily counts: {last:?}");
 }
 
 /// 索引在保存后异步追上；轮询直到条目数达到预期。
@@ -435,20 +448,16 @@ async fn settings_updates_emit_a_section_only_change_event() {
 
     update(SettingsPatch {
         general: Some(GeneralSettingsPatch {
-            language: Some(Some("zh-CN".into())),
+            device_name: Some(Some("Synthetic Settings Device".to_string())),
+        }),
+        sync: Some(SyncSettingsPatch {
+            sync_on_restore: Some(true),
             ..Default::default()
         }),
-        quick_panel: Some(QuickPanelSettingsPatch {
-            position: Some(QuickPanelPositionSummary::FollowCursor),
+        file_sync: Some(uc_engine::FileSyncSettingsPatch {
+            file_retention_hours: Some(48),
             ..Default::default()
         }),
-        keyboard_shortcuts: Some(
-            [(
-                "quick_panel.toggle".to_string(),
-                Some(uc_engine::ShortcutKeySummary::Single("ctrl+alt+p".into())),
-            )]
-            .into(),
-        ),
         ..Default::default()
     })
     .await;
@@ -457,8 +466,8 @@ async fn settings_updates_emit_a_section_only_change_event() {
         .expect("a successful update emits SettingsChanged");
     for expected in [
         SettingsSectionSummary::General,
-        SettingsSectionSummary::QuickPanel,
-        SettingsSectionSummary::KeyboardShortcuts,
+        SettingsSectionSummary::Sync,
+        SettingsSectionSummary::FileSync,
     ] {
         assert!(sections.contains(&expected), "{expected:?} in {sections:?}");
     }
@@ -467,8 +476,7 @@ async fn settings_updates_emit_a_section_only_change_event() {
     // 内容没变的保存不通知。
     update(SettingsPatch {
         general: Some(GeneralSettingsPatch {
-            language: Some(Some("zh-CN".into())),
-            ..Default::default()
+            device_name: Some(Some("Synthetic Settings Device".to_string())),
         }),
         ..Default::default()
     })
@@ -518,14 +526,14 @@ async fn concurrent_settings_updates_are_all_covered_by_notifications() {
     let engine = Arc::new(engine);
     let mut tasks = Vec::new();
     for round in 0..8 {
-        let language = format!("lang-{round}");
+        let device_name = format!("device-{round}");
         let engine_a = Arc::clone(&engine);
         let engine_b = Arc::clone(&engine);
         tasks.push(tokio::spawn(async move {
             engine_a
                 .execute(Operation::UpdateSettings(Box::new(SettingsPatch {
                     general: Some(GeneralSettingsPatch {
-                        language: Some(Some(language)),
+                        device_name: Some(Some(device_name)),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -536,8 +544,8 @@ async fn concurrent_settings_updates_are_all_covered_by_notifications() {
         tasks.push(tokio::spawn(async move {
             engine_b
                 .execute(Operation::UpdateSettings(Box::new(SettingsPatch {
-                    quick_panel: Some(QuickPanelSettingsPatch {
-                        enabled: Some(round % 2 == 0),
+                    sync: Some(SyncSettingsPatch {
+                        sync_on_restore: Some(round % 2 == 0),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -557,10 +565,7 @@ async fn concurrent_settings_updates_are_all_covered_by_notifications() {
         }
     }
     assert!(seen.contains(&SettingsSectionSummary::General), "{seen:?}");
-    assert!(
-        seen.contains(&SettingsSectionSummary::QuickPanel),
-        "{seen:?}"
-    );
+    assert!(seen.contains(&SettingsSectionSummary::Sync), "{seen:?}");
     let OperationResult::Settings(final_settings) =
         engine.execute(Operation::QuerySettings).await.unwrap()
     else {
@@ -569,8 +574,10 @@ async fn concurrent_settings_updates_are_all_covered_by_notifications() {
     // 并发任务的落盘顺序不固定，只断言最终值确实来自这些更新之一。
     assert!(final_settings
         .general
-        .language
+        .device_name
         .as_deref()
-        .is_some_and(|language| language.starts_with("lang-")));
-    engine.shutdown(Duration::from_secs(15)).await.unwrap();
+        .is_some_and(|device_name| device_name.starts_with("device-")));
+    // 此用例验证并发设置通知；清理完整等待，期限合同由独立关闭测试验证。
+    // 整个真实 fixture 仍受 Nextest 外层期限约束。
+    engine.shutdown_until_complete().await.unwrap();
 }

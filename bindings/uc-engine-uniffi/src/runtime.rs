@@ -12,14 +12,18 @@ use uc_engine::observability::{
     AnalyticsPort, DeviceType, Event, GroupIdentifyPayload, IdentifyPayload, Os, ReleaseOutcome,
 };
 use uc_engine::{
-    ChangeEncryptionPassphraseInput, ClipboardRestoreMode, ClipboardRestoreOutcome,
-    CreateSpaceInput, CustomRelayMutation, CustomRelayMutationOutcome, CustomRelayRejection,
-    Engine, EngineConfig, ExportEntryInput, HostCapabilities, HostCapabilityError,
-    HostCapabilityErrorCategory, HostClipboard, HostClipboardRepresentation, HostClipboardSnapshot,
-    HostDirectories, HostFileAccess, HostFileHandle, HostFileMetadata, HostSecureStorage,
-    JoinSpaceInput, ObserveClipboardChangeInput, Operation, OperationResult, RecoverSessionInput,
-    RemoveMemberInput, ResendEntryInput, RestoreClipboardInput, SecretString, SendFilesInput,
-    SendImageInput, SendTextInput, StartupLifecycleInput, StartupProgress,
+    CancelEntryReceiveInput, CancelInboundTransferInput, ChangeEncryptionPassphraseInput,
+    ClipboardRestoreMode, ClipboardRestoreOutcome,
+    ConfigImportRejectionReason as EngineConfigImportRejectionReason, CreateSpaceInput,
+    CustomRelayMutation, CustomRelayMutationOutcome, CustomRelayRejection, Engine, EngineConfig,
+    EntryReceiveProgressInput, EntryReceiveRetryOutcome as EngineReceiveRetryOutcome,
+    ExportEntryInput, HostCapabilities, HostCapabilityError, HostCapabilityErrorCategory,
+    HostClipboard, HostClipboardRepresentation, HostClipboardSnapshot, HostDirectories,
+    HostFileAccess, HostFileHandle, HostFileMetadata, HostSecureStorage, JoinSpaceInput,
+    ObserveClipboardChangeInput, Operation, OperationResult, ReceiveProgressSummary,
+    RecoverSessionInput, RemoveMemberInput, ResendEntryInput, RestoreClipboardInput,
+    RetryEntryReceiveInput, SecretString, SendFilesInput, SendImageInput, SendTextInput,
+    StartupLifecycleInput, StartupProgress, TransferCancellationReason,
 };
 use zeroize::Zeroizing;
 
@@ -187,6 +191,34 @@ pub struct SessionRecovery {
     pub resumed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum ReceiveRetryOutcome {
+    Accepted { attempt_id: String },
+    AlreadyReceiving,
+    Superseded,
+    CancellationIncomplete,
+    Unavailable { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReceiveItem {
+    pub item_id: String,
+    pub kind: String,
+    pub state: String,
+    pub failure_reason: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReceiveProgress {
+    pub entry_id: String,
+    pub attempt_id: String,
+    pub state: String,
+    pub total_bytes: i64,
+    pub completed_bytes: i64,
+    pub items_total: u32,
+    pub items_completed: u32,
+    pub items: Vec<ReceiveItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ActiveClipboard {
     pub entry_id: String,
@@ -240,6 +272,8 @@ pub struct JoinedSpace {
 pub enum JoinSpaceRejectionReason {
     InvitationUnavailable,
     AuthenticationRejected,
+    /// Sponsor 收下请求后在截止内没有应答；不是口令错误。
+    SponsorUnresponsive,
     IdentityConflict,
     BaseHistoryChanged,
     JoinerHistoryAhead,
@@ -264,11 +298,13 @@ pub enum JoinSpaceTerminationReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum JoinSpaceAttentionReason {
     OutcomeCannotBeProven,
+    ContinuationUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum JoinSpaceAttentionRecovery {
     PreserveDataAndContactSupport,
+    RestartWithNewInvitation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -326,6 +362,21 @@ pub struct PeerConnectionRefresh {
     pub online: u64,
     pub offline: u64,
     pub errors: u64,
+}
+
+/// 配置导入未完成的安全原因；不包含私有文件或凭据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ConfigImportRejectionReason {
+    UnsupportedFormat,
+    MalformedMarker,
+    MissingRuntimeMembers,
+}
+
+/// 真实 Engine 查询的持久拒绝结果；Mobile 负责按原因本地化提示。
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RejectedConfigImport {
+    pub reason: ConfigImportRejectionReason,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -598,6 +649,9 @@ enum WorkerCommand {
     QueryNetworkRecoveryStatus {
         response: mpsc::Sender<Result<NetworkRecoveryStatus, BindingError>>,
     },
+    QueryRejectedConfigImport {
+        response: mpsc::Sender<Result<Option<RejectedConfigImport>, BindingError>>,
+    },
     QuerySpaceState {
         response: mpsc::Sender<Result<SpaceState, BindingError>>,
     },
@@ -677,6 +731,28 @@ enum WorkerCommand {
         entry_id: String,
         mode: BindingClipboardRestoreMode,
         response: mpsc::Sender<Result<BindingClipboardRestoreOutcome, BindingError>>,
+    },
+    RetryEntryReceive {
+        entry_id: String,
+        expected_attempt_id: String,
+        item_ids: Vec<String>,
+        response: mpsc::Sender<Result<ReceiveRetryOutcome, BindingError>>,
+    },
+    CancelEntryReceive {
+        entry_id: String,
+        attempt_id: String,
+        response: mpsc::Sender<Result<String, BindingError>>,
+    },
+    CancelInboundTransfer {
+        transfer_id: String,
+        response: mpsc::Sender<Result<String, BindingError>>,
+    },
+    QueryEntryReceiveProgress {
+        entry_id: String,
+        response: mpsc::Sender<Result<Option<ReceiveProgress>, BindingError>>,
+    },
+    ListEntryReceiveProgress {
+        response: mpsc::Sender<Result<Vec<ReceiveProgress>, BindingError>>,
     },
     QueryActiveClipboard {
         response: mpsc::Sender<Result<Option<ActiveClipboard>, BindingError>>,
@@ -1145,6 +1221,13 @@ impl MobileEngine {
         self.request(|response| WorkerCommand::QueryNetworkRecoveryStatus { response })
     }
 
+    /// 查询持久拒绝状态；None 不表示导入成功，读取错误保留 Engine 错误字段。
+    pub fn query_rejected_config_import(
+        &self,
+    ) -> Result<Option<RejectedConfigImport>, BindingError> {
+        self.request(|response| WorkerCommand::QueryRejectedConfigImport { response })
+    }
+
     pub fn query_space_state(&self) -> Result<SpaceState, BindingError> {
         self.request(|response| WorkerCommand::QuerySpaceState { response })
     }
@@ -1415,6 +1498,52 @@ impl MobileEngine {
             .recv()
             // discarded-source[channel]: `std::sync::mpsc::RecvError`: the error only means the peer is gone or carries the unsent payload, which must not outlive it
             .map_err(|_| BindingError::RuntimeUnavailable)?
+    }
+
+    /// 只提交完整重试意图，接受之后由Engine继续监督实际接收。
+    pub fn retry_entry_receive(
+        &self,
+        entry_id: String,
+        expected_attempt_id: String,
+        item_ids: Vec<String>,
+    ) -> Result<ReceiveRetryOutcome, BindingError> {
+        self.request(|response| WorkerCommand::RetryEntryReceive {
+            entry_id,
+            expected_attempt_id,
+            item_ids,
+            response,
+        })
+    }
+
+    /// 用户取消整个接收尝试；仍在收尾时返回 cancellation_incomplete。
+    pub fn cancel_entry_receive(
+        &self,
+        entry_id: String,
+        attempt_id: String,
+    ) -> Result<String, BindingError> {
+        self.request(|response| WorkerCommand::CancelEntryReceive {
+            entry_id,
+            attempt_id,
+            response,
+        })
+    }
+
+    /// 用户主动取消单项；固定使用 LocalUser 原因。
+    pub fn cancel_inbound_transfer(&self, transfer_id: String) -> Result<String, BindingError> {
+        self.request(|response| WorkerCommand::CancelInboundTransfer {
+            transfer_id,
+            response,
+        })
+    }
+
+    pub fn query_entry_receive_progress(
+        &self,
+        entry_id: String,
+    ) -> Result<Option<ReceiveProgress>, BindingError> {
+        self.request(|response| WorkerCommand::QueryEntryReceiveProgress { entry_id, response })
+    }
+    pub fn list_entry_receive_progress(&self) -> Result<Vec<ReceiveProgress>, BindingError> {
+        self.request(|response| WorkerCommand::ListEntryReceiveProgress { response })
     }
 
     pub fn query_active_clipboard(&self) -> Result<Option<ActiveClipboard>, BindingError> {
@@ -1752,6 +1881,17 @@ async fn run_operations(
                     .and_then(map_network_recovery_status);
                 let _ = response.send(result);
             }
+            WorkerCommand::QueryRejectedConfigImport { response } => {
+                let result = engine
+                    .execute(Operation::QueryDiagnostics)
+                    .await
+                    .map_err(BindingError::from)
+                    .and_then(map_rejected_config_import);
+                if let Err(error) = &result {
+                    log_mobile_failure("query_rejected_config_import", error);
+                }
+                let _ = response.send(result);
+            }
             WorkerCommand::QuerySpaceState { response } => {
                 let result = engine
                     .execute(Operation::QuerySetupState)
@@ -1992,6 +2132,77 @@ async fn run_operations(
                     .and_then(map_clipboard_restored);
                 let _ = response.send(result);
             }
+            WorkerCommand::RetryEntryReceive {
+                entry_id,
+                expected_attempt_id,
+                item_ids,
+                response,
+            } => {
+                let result = engine
+                    .execute(Operation::RetryEntryReceive(RetryEntryReceiveInput {
+                        entry_id,
+                        expected_attempt_id,
+                        item_ids,
+                    }))
+                    .await
+                    .map_err(BindingError::from)
+                    .and_then(map_entry_receive_retry);
+                let _ = response.send(result);
+            }
+            WorkerCommand::CancelEntryReceive {
+                entry_id,
+                attempt_id,
+                response,
+            } => {
+                let result = engine
+                    .execute(Operation::CancelEntryReceive(CancelEntryReceiveInput {
+                        entry_id,
+                        attempt_id,
+                    }))
+                    .await
+                    .map_err(BindingError::from)
+                    .and_then(map_entry_receive_cancellation);
+                let _ = response.send(result);
+            }
+            WorkerCommand::CancelInboundTransfer {
+                transfer_id,
+                response,
+            } => {
+                let result = engine
+                    .execute(Operation::CancelInboundTransfer(
+                        CancelInboundTransferInput {
+                            transfer_id,
+                            reason: TransferCancellationReason::LocalUser,
+                        },
+                    ))
+                    .await
+                    .map_err(BindingError::from)
+                    .and_then(map_inbound_transfer_cancellation);
+                let _ = response.send(result);
+            }
+            WorkerCommand::QueryEntryReceiveProgress { entry_id, response } => {
+                let result = engine
+                    .execute(Operation::QueryEntryReceiveProgress(
+                        EntryReceiveProgressInput { entry_id },
+                    ))
+                    .await
+                    .map_err(BindingError::from)
+                    .and_then(map_receive_progress);
+                let _ = response.send(result);
+            }
+            WorkerCommand::ListEntryReceiveProgress { response } => {
+                let result = engine
+                    .execute(Operation::ListEntryReceiveProgress)
+                    .await
+                    .map_err(BindingError::from)
+                    .and_then(|result| match result {
+                        OperationResult::EntryReceiveProgressList(progress) => {
+                            Ok(progress.into_iter().map(receive_progress).collect())
+                        }
+                        _ => Err(BindingError::UnexpectedResult),
+                    });
+                let _ = response.send(result);
+            }
             WorkerCommand::QueryActiveClipboard { response } => {
                 let result = engine
                     .execute(Operation::QueryActiveClipboard)
@@ -2221,6 +2432,19 @@ fn map_space_created(result: OperationResult) -> Result<SpaceCreated, BindingErr
     })
 }
 
+fn map_rejected_config_import(
+    result: OperationResult,
+) -> Result<Option<RejectedConfigImport>, BindingError> {
+    unpack_operation!(result, OperationResult::DiagnosticsStatus(status) => status.rejected_config_import.map(|rejected| RejectedConfigImport {
+        reason: match rejected.reason {
+            EngineConfigImportRejectionReason::UnsupportedFormat => ConfigImportRejectionReason::UnsupportedFormat,
+            EngineConfigImportRejectionReason::MalformedMarker => ConfigImportRejectionReason::MalformedMarker,
+            EngineConfigImportRejectionReason::MissingRuntimeMembers => ConfigImportRejectionReason::MissingRuntimeMembers,
+        },
+        message: rejected.message,
+    }))
+}
+
 fn map_space_state(result: OperationResult) -> Result<SpaceState, BindingError> {
     unpack_operation!(result, OperationResult::SetupState(state) => SpaceState {
         has_completed: state.has_completed,
@@ -2427,10 +2651,16 @@ fn map_join_space_status(result: OperationResult) -> Result<JoinSpaceStatus, Bin
                 uc_engine::JoinSpaceAttentionReasonSummary::OutcomeCannotBeProven => {
                     JoinSpaceAttentionReason::OutcomeCannotBeProven
                 }
+                uc_engine::JoinSpaceAttentionReasonSummary::ContinuationUnavailable => {
+                    JoinSpaceAttentionReason::ContinuationUnavailable
+                }
             },
             recovery: match recovery {
                 uc_engine::JoinSpaceAttentionRecoverySummary::PreserveDataAndContactSupport => {
                     JoinSpaceAttentionRecovery::PreserveDataAndContactSupport
+                }
+                uc_engine::JoinSpaceAttentionRecoverySummary::RestartWithNewInvitation => {
+                    JoinSpaceAttentionRecovery::RestartWithNewInvitation
                 }
             },
             next_retry_at_ms,
@@ -2444,6 +2674,9 @@ fn map_join_space_status(result: OperationResult) -> Result<JoinSpaceStatus, Bin
                     }
                     uc_engine::JoinSpaceRejectionReasonSummary::AuthenticationRejected => {
                         JoinSpaceRejectionReason::AuthenticationRejected
+                    }
+                    uc_engine::JoinSpaceRejectionReasonSummary::SponsorUnresponsive => {
+                        JoinSpaceRejectionReason::SponsorUnresponsive
                     }
                     uc_engine::JoinSpaceRejectionReasonSummary::IdentityConflict => {
                         JoinSpaceRejectionReason::IdentityConflict
@@ -2705,6 +2938,48 @@ fn map_clipboard_restored(
     }
 }
 
+fn receive_progress(progress: ReceiveProgressSummary) -> ReceiveProgress {
+    ReceiveProgress {
+        entry_id: progress.entry_id,
+        attempt_id: progress.attempt_id,
+        state: progress.state,
+        total_bytes: progress.total_bytes,
+        completed_bytes: progress.completed_bytes,
+        items_total: progress.items_total,
+        items_completed: progress.items_completed,
+        items: progress
+            .items
+            .into_iter()
+            .map(|item| ReceiveItem {
+                item_id: item.item_id,
+                kind: item.kind.to_string(),
+                state: item.state,
+                failure_reason: item.failure_reason.map(|reason| reason.to_string()),
+            })
+            .collect(),
+    }
+}
+fn map_entry_receive_retry(result: OperationResult) -> Result<ReceiveRetryOutcome, BindingError> {
+    unpack_operation!(result, OperationResult::EntryReceiveRetry(outcome) => match outcome {
+        EngineReceiveRetryOutcome::Accepted { attempt_id } => ReceiveRetryOutcome::Accepted { attempt_id },
+        EngineReceiveRetryOutcome::AlreadyReceiving => ReceiveRetryOutcome::AlreadyReceiving,
+        EngineReceiveRetryOutcome::Superseded => ReceiveRetryOutcome::Superseded,
+        EngineReceiveRetryOutcome::CancellationIncomplete => ReceiveRetryOutcome::CancellationIncomplete,
+        EngineReceiveRetryOutcome::Unavailable { reason } => ReceiveRetryOutcome::Unavailable { reason: reason.to_string() },
+    })
+}
+
+fn map_entry_receive_cancellation(result: OperationResult) -> Result<String, BindingError> {
+    unpack_operation!(result, OperationResult::EntryReceiveCancellation(outcome) => outcome.to_string())
+}
+fn map_inbound_transfer_cancellation(result: OperationResult) -> Result<String, BindingError> {
+    unpack_operation!(result, OperationResult::InboundTransferCancellation(outcome) => outcome.to_string())
+}
+
+fn map_receive_progress(result: OperationResult) -> Result<Option<ReceiveProgress>, BindingError> {
+    unpack_operation!(result, OperationResult::EntryReceiveProgress(progress) => progress.map(receive_progress))
+}
+
 fn map_active_clipboard(result: OperationResult) -> Result<Option<ActiveClipboard>, BindingError> {
     unpack_operation!(result, OperationResult::ActiveClipboard(active) => active.map(|active| ActiveClipboard {
         entry_id: active.entry_id,
@@ -2724,12 +2999,10 @@ fn count_to_u64(value: usize) -> Result<u64, BindingError> {
 pub(crate) fn host_directories(
     host: &Arc<dyn BindingHost>,
 ) -> Result<HostDirectories, BindingError> {
-    let cache_directory = host_path(host.cache_directory())?;
-    Ok(HostDirectories::new(
+    Ok(HostDirectories::mobile(
         host_path(host.private_data_directory())?,
-        cache_directory.clone(),
+        host_path(host.cache_directory())?,
         host_path(host.temporary_directory())?,
-        cache_directory.join("logs"),
     ))
 }
 
@@ -3084,6 +3357,7 @@ mod tests {
                 pairing_confirmation: Some(
                     uc_engine::PairingConfirmationSummary::AwaitingPeerConfirmation,
                 ),
+                group_update: None,
                 available_actions: Vec::new(),
                 blocked_reason: None,
             });
@@ -3603,3 +3877,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod receive_tests;

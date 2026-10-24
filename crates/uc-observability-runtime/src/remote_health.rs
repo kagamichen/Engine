@@ -145,6 +145,27 @@ pub(crate) fn record_remote_setup_degraded(failure: RemoteSetupFailure) {
     );
 }
 
+/// 本地文件由可用转为失败时记录一次；`class` 是固定的失败动作分类，不含路径或系统错误正文。
+pub(crate) fn record_local_file_failed(class: &'static str) {
+    tracing::event!(
+        target: "observability.health",
+        parent: None,
+        tracing::Level::WARN,
+        event.name = "uc.observability.local_file_failed",
+        error.type = class,
+    );
+}
+
+/// 本地文件失败后首次再次写入成功时记录一次。
+pub(crate) fn record_local_file_recovered() {
+    tracing::event!(
+        target: "observability.health",
+        parent: None,
+        tracing::Level::INFO,
+        event.name = "uc.observability.local_file_recovered",
+    );
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CapacityGate {
     state: Arc<Mutex<CapacityState>>,
@@ -674,6 +695,7 @@ fn span_record_kind(span: &SpanData) -> Option<&'static str> {
                     | "clipboard.copy_and_sync"
                     | "clipboard.send"
                     | "clipboard.resend"
+                    | "clipboard.retry_receive"
                     | "membership_recovery"
                     | "profile_storage_upgrade"
                     | "runtime.recover_session"
@@ -886,6 +908,8 @@ fn valid_operation(value: &str) -> bool {
         value,
         "clipboard.send"
             | "clipboard.resend"
+            | "clipboard.retry_receive"
+            | "clipboard.export_file"
             | "clipboard.copy_and_sync"
             | "clipboard.persist"
             | "clipboard.write_system"
@@ -954,6 +978,8 @@ fn operation_matches_domain(domain: &str, operation: &str) -> bool {
             "clipboard",
             "clipboard.send"
                 | "clipboard.resend"
+                | "clipboard.retry_receive"
+                | "clipboard.export_file"
                 | "clipboard.copy_and_sync"
                 | "clipboard.persist"
                 | "clipboard.write_system"
@@ -979,6 +1005,8 @@ fn span_role_matches(operation: &str, role: &str, kind: &SpanKind) -> bool {
         "membership_recovery" => role == "local" && kind == &SpanKind::Internal,
         "clipboard.send"
         | "clipboard.resend"
+        | "clipboard.retry_receive"
+        | "clipboard.export_file"
         | "clipboard.copy_and_sync"
         | "clipboard.persist"
         | "clipboard.write_system" => role == "local" && kind == &SpanKind::Internal,
@@ -1012,6 +1040,8 @@ fn log_role_matches(operation: &str, role: &str) -> bool {
         "membership_recovery" => role == "local",
         "clipboard.send"
         | "clipboard.resend"
+        | "clipboard.retry_receive"
+        | "clipboard.export_file"
         | "clipboard.copy_and_sync"
         | "clipboard.persist"
         | "clipboard.write_system" => role == "local",

@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,10 +18,11 @@ pub enum HostCapabilityErrorCategory {
     Io,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct HostCapabilityError {
     category: HostCapabilityErrorCategory,
     detail: String,
+    source: Option<Arc<dyn Error + Send + Sync>>,
 }
 
 impl HostCapabilityError {
@@ -28,7 +30,14 @@ impl HostCapabilityError {
         Self {
             category,
             detail: detail.into(),
+            source: None,
         }
+    }
+
+    /// 保存宿主的具体来源供固定分类与安全诊断链读取；不得直接格式化来源正文。
+    pub fn with_source(mut self, source: Box<dyn Error + Send + Sync>) -> Self {
+        self.source = Some(Arc::from(source));
+        self
     }
 
     pub fn category(&self) -> HostCapabilityErrorCategory {
@@ -52,7 +61,22 @@ impl fmt::Display for HostCapabilityError {
     }
 }
 
-impl std::error::Error for HostCapabilityError {}
+impl Error for HostCapabilityError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source.as_deref().map(|source| source as &dyn Error)
+    }
+}
+
+// 相等比较保留既有宿主分类与说明语义；诊断来源不参与值比较。
+impl PartialEq for HostCapabilityError {
+    fn eq(&self, other: &Self) -> bool {
+        self.category == other.category && self.detail == other.detail
+    }
+}
+
+impl Eq for HostCapabilityError {}
+
+const MOBILE_LOGS_DIRECTORY: &str = "logs";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct HostDirectories {
@@ -76,6 +100,20 @@ impl HostDirectories {
             logs,
             upgrade_backups,
         }
+    }
+
+    /// 移动端布局：日志放在私有数据目录的 `logs` 下，与缓存、临时目录互不包含。
+    ///
+    /// 缓存会在离开空间、清理缓存时整体删除；进程级日志写入器持有当天文件，日志若在缓存内
+    /// 就会被删掉，之后的记录写进已脱离目录的文件。
+    pub fn mobile(private_data: PathBuf, cache: PathBuf, temporary: PathBuf) -> Self {
+        let logs = private_data.join(MOBILE_LOGS_DIRECTORY);
+        Self::new(private_data, cache, temporary, logs)
+    }
+
+    /// 旧版移动端布局曾把日志放在缓存目录内；只用于安装观测运行期时的一次性迁移。
+    pub fn legacy_mobile_logs(&self) -> PathBuf {
+        self.cache.join(MOBILE_LOGS_DIRECTORY)
     }
 
     pub fn private_data(&self) -> &Path {

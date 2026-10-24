@@ -68,17 +68,24 @@ pub use membership::{
     DecideDeviceTrustChangeResult, DeviceTrustChangeChoice,
 };
 pub use membership::{
+    ApplyGroupUpdatePort, GroupUpdateApplyError, GroupUpdateEndpoint, GroupUpdateIncoming,
+    GroupUpdateLocalWorkPort, GroupUpdateReceiveOutcome, GroupUpdateReceiverPort,
+    GroupUpdateRecoveryRecord, GroupUpdateWirePort, GroupUpdateWork, PreparedGroupUpdate,
+    VerifiedHistoryGroupUpdate,
+};
+pub use membership::{
     DeviceGroupChoiceImpact, MembershipConflictBranchView, MembershipConflictStatus,
     MembershipConflictView, MembershipConflictsView, MembershipDiagnosticsView,
     QueryMembershipConflictsError, QueryMembershipDiagnosticsError, ResolveMembershipConflictError,
     ResolveMembershipConflictInput, ResolveMembershipConflictResult,
 };
 pub use membership::{
-    DeviceTrustDevice, DeviceTrustImpact, DeviceTrustMembership, DeviceTrustObservation,
-    DeviceTrustRelationship, DeviceTrustStatus, DeviceTrustSyncState,
-    PairingConfirmationObservation, PairingConfirmationStatus, PairingConfirmationTarget,
-    PendingDeviceTrustChange, QueryDeviceTrustError, SpaceDeviceUpdatePhase,
-    SpaceDeviceUpdateProblem, SpaceDeviceUpdateRecovery, SpaceDeviceUpdateStatus,
+    DeviceGroupUpdate, DeviceGroupUpdateRecovery, DeviceGroupUpdateState, DeviceTrustDevice,
+    DeviceTrustImpact, DeviceTrustMembership, DeviceTrustObservation, DeviceTrustRelationship,
+    DeviceTrustStatus, DeviceTrustSyncState, PairingConfirmationObservation,
+    PairingConfirmationStatus, PairingConfirmationTarget, PendingDeviceTrustChange,
+    QueryDeviceTrustError, SpaceDeviceUpdatePhase, SpaceDeviceUpdateProblem,
+    SpaceDeviceUpdateRecovery, SpaceDeviceUpdateStatus,
 };
 pub use membership::{
     MembershipBranchRecoveryRecord, MembershipHistoryExchangeRecord, MembershipRecord,
@@ -109,22 +116,23 @@ pub use admission::{
     JoinerCancellationMaterial, JoinerCancellationMaterialError, JoinerCancellationMutation,
     JoinerCancellationStateError, JoinerMembershipStart, JoinerStartMaterial,
     JoinerStartMaterialError, JoinerStartMaterialPort, JoinerStartMutation, JoinerStartStateError,
-    JoinerStartStatePort, LoadedAdmissionRecovery, LoadedCurrentJoin, LoadedJoinerActivation,
-    LoadedJoinerStartState, LoadedPendingAdmission, LoadedSponsorAbandonment,
-    LoadedSponsorAdmission, LoadedSponsorDeadline, PendingAdmissionRecoveryStateError,
-    PendingAdmissionRecoveryStatePort, PrepareJoinerActivationError, PrepareJoinerActivationPort,
-    PrepareJoinerAppliedError, PrepareJoinerAppliedPort, PrepareJoinerCancellationPort,
-    PrepareJoinerCandidateError, PrepareJoinerCandidatePort, PrepareJoinerInvitationError,
-    PrepareJoinerInvitationPort, PrepareSponsorCandidateError, PrepareSponsorCandidatePort,
-    PrepareSponsorCommitError, PrepareSponsorCommitPort, PrepareSponsorCompleteError,
-    PrepareSponsorCompletePort, PrepareSponsorSettledError, PrepareSponsorSettledPort,
-    PreparedJoinerActivation, PreparedJoinerAppliedMaterial, PreparedJoinerCandidateMaterial,
-    PreparedJoinerInvitation, PreparedSponsorCandidate, PreparedSponsorCommit,
-    PreparedSponsorComplete, PreparedSponsorSettled, ResolveJoinerInvitationError,
-    ResolveJoinerInvitationPort, SpaceAdmissionCommitToken, SpaceAdmissionMessageReply,
-    SpaceAdmissionTransportError, SpaceAdmissionTransportPort, SponsorAdmissionCommitToken,
-    SponsorAdmissionMutation, SponsorAdmissionState, SponsorAdmissionStateError,
-    SponsorAdmissionStatePort, ValidateJoinerActivationIntentPort,
+    JoinerStartStatePort, JoinerTransportMaterial, JoinerTransportMaterialPort,
+    LoadedAdmissionRecovery, LoadedCurrentJoin, LoadedJoinerActivation, LoadedJoinerStartState,
+    LoadedPendingAdmission, LoadedSponsorAbandonment, LoadedSponsorAdmission,
+    LoadedSponsorDeadline, PendingAdmissionRecoveryStateError, PendingAdmissionRecoveryStatePort,
+    PrepareJoinerActivationError, PrepareJoinerActivationPort, PrepareJoinerAppliedError,
+    PrepareJoinerAppliedPort, PrepareJoinerCancellationPort, PrepareJoinerCandidateError,
+    PrepareJoinerCandidatePort, PrepareJoinerInvitationError, PrepareJoinerInvitationPort,
+    PrepareSponsorCandidateError, PrepareSponsorCandidatePort, PrepareSponsorCommitError,
+    PrepareSponsorCommitPort, PrepareSponsorCompleteError, PrepareSponsorCompletePort,
+    PrepareSponsorSettledError, PrepareSponsorSettledPort, PreparedJoinerActivation,
+    PreparedJoinerAppliedMaterial, PreparedJoinerCandidateMaterial, PreparedJoinerInvitation,
+    PreparedSponsorCandidate, PreparedSponsorCommit, PreparedSponsorComplete,
+    PreparedSponsorSettled, ResolveJoinerInvitationError, ResolveJoinerInvitationPort,
+    SpaceAdmissionCommitToken, SpaceAdmissionMessageReply, SpaceAdmissionTransportError,
+    SpaceAdmissionTransportPort, SponsorAdmissionCommitToken, SponsorAdmissionMutation,
+    SponsorAdmissionState, SponsorAdmissionStateError, SponsorAdmissionStatePort,
+    SponsorContinuationRoutePort, ValidateJoinerActivationIntentPort,
 };
 pub use admission::{
     AdmissionSpaceTransitionError, AdmissionSpaceTransitionPort,
@@ -178,3 +186,14 @@ pub use membership::{CurrentMemberSignatureError, CurrentMemberSignaturePort};
 #[cfg(test)]
 mod application_tests;
 pub use membership::MembershipProjectionPlan;
+
+pub use membership::{
+    membership_history_purpose, HistoryConnectionRetentionPort, HistoryIncoming,
+    HistoryLocalWorkPort, HistoryPeerBindingPort, HistoryReceiverPort, HistoryReply,
+    HistoryWirePort, HistoryWork, MembershipHistoryReceiver, MembershipHistoryTransport,
+};
+
+pub use connectivity::{
+    PeerReachabilityEnvironmentPort, PeerReachabilityTransport, PeerReachabilityTransportError,
+    PeerReachabilityTransportPorts, PeerReachabilityWireError, PeerReachabilityWirePort,
+};

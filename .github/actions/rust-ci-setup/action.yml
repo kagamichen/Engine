@@ -9,36 +9,26 @@ inputs:
     required: true
   fast-compile-infra:
     description: >-
-      Build uc-infra without the opt-level 3 override from Cargo.toml. Only for jobs whose results do not
+      Build all seven uc-infra-* crates without the opt-level 3 override from Cargo.toml. Only for jobs whose results do not
       depend on that optimization level, such as instrumented coverage.
     required: false
     default: "false"
-  compile-cache-access:
-    description: >-
-      write only for jobs bound to the branch-restricted engine-build-cache-writer environment; read otherwise.
-      The R2 token itself enforces the permission, this only selects the sccache read/write mode.
-    required: false
-    default: read
   compile-cache-r2-endpoint:
-    description: R2 S3 endpoint secret; empty selects the GitHub Actions cache fallback.
+    description: R2 S3 endpoint secret; empty selects the local MBX cache.
     required: false
     default: ""
   compile-cache-r2-access-key-id:
-    description: R2 S3 access key id secret; empty selects the GitHub Actions cache fallback.
+    description: R2 S3 access key id secret; empty selects the local MBX cache.
     required: false
     default: ""
   compile-cache-r2-secret-access-key:
-    description: R2 S3 secret access key secret; empty selects the GitHub Actions cache fallback.
+    description: R2 S3 secret access key secret; empty selects the local MBX cache.
     required: false
     default: ""
   dependency-cache:
-    description: Restore and save third-party build outputs with rust-cache. Disabled only for cold-cache measurements.
+    description: Cache Cargo downloads only; never restore target or live MBX directories.
     required: false
     default: "true"
-  compile-cache-key-prefix:
-    description: Override of the R2 object prefix, only for disposable benchmark prefixes under engine/.
-    required: false
-    default: ""
 
 runs:
   using: composite
@@ -47,33 +37,29 @@ runs:
       shell: bash
       run: rustup show active-toolchain
 
-    - name: Cache Rust dependencies
+    - name: Start MBX compiler cache
+      shell: bash
+      run: bash scripts/build-cache/start-ci-mbx.sh
+
+    - name: Restore compressed MBX snapshot
+      uses: ./.github/actions/mbx-snapshot
+      with:
+        scene: ${{ inputs.cache-key }}
+        endpoint: ${{ inputs.compile-cache-r2-endpoint }}
+        access-key-id: ${{ inputs.compile-cache-r2-access-key-id }}
+        secret-access-key: ${{ inputs.compile-cache-r2-secret-access-key }}
+
+    # 只缓存 Cargo 下载；MBX 必须经导出闭包归档，禁止转储 live cache 或 target。
+    - name: Cache Cargo downloads
       if: inputs.dependency-cache == 'true'
       uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
       with:
         workspaces: . -> target
-        shared-key: ${{ inputs.cache-key }}
-
-    # rust-cache 只保留第三方依赖与 Cargo 下载内容；工作区 crate 由 sccache 按内容缓存，未改动的 crate 跨运行复用。
-    - name: Install compiler cache
-      uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-      with:
-        # 不指定时 action 会安装最新发布；版本与 start-ci-sccache.sh 中的二进制摘要同步固定。
-        version: v0.18.0
-
-    # 选择唯一缓存后端并常驻 sccache 服务；R2 凭据只进入服务进程环境，不写入 GITHUB_ENV。
-    - name: Start compiler cache
-      shell: bash
-      env:
-        BUILD_CACHE_ACCESS: ${{ inputs.compile-cache-access }}
-        BUILD_CACHE_R2_ENDPOINT: ${{ inputs.compile-cache-r2-endpoint }}
-        BUILD_CACHE_R2_ACCESS_KEY_ID: ${{ inputs.compile-cache-r2-access-key-id }}
-        BUILD_CACHE_R2_SECRET_ACCESS_KEY: ${{ inputs.compile-cache-r2-secret-access-key }}
-        BUILD_CACHE_KEY_PREFIX: ${{ inputs.compile-cache-key-prefix }}
-      run: bash scripts/build-cache/start-ci-sccache.sh
+        shared-key: mbx-${{ inputs.cache-key }}
+        cache-targets: 'false'
 
     # 显式提供构建来源后，uc-observability-runtime 的 build script 不再跟踪 git 与源码目录的修改时间；
-    # 否则同一 job 内每次 cargo 调用都可能重跑它，并连锁重编 uc-infra、uc-engine 与全部宿主。
+    # 否则同一 job 内每次 cargo 调用都可能重跑它，并连锁重编 uc-infra-profile、uc-engine 与全部宿主。
     - name: Record build provenance
       shell: bash
       run: |
@@ -84,13 +70,15 @@ runs:
           echo "UC_ENGINE_SOURCE_STATE=$state"
         } >> "$GITHUB_ENV"
 
-    # Cargo.toml 为移动端开发构建把 uc-infra 设为 opt-level 3，测试构建因此多花一倍以上编译时间。
+    # Cargo.toml 为移动端开发构建把七个 uc-infra-* crate 设为 opt-level 3，测试构建因此多花一倍以上编译时间。
     # 诊断栈符号校验与真实网络、多设备时序都依赖该优化级别，只有已按 release 口径校验诊断栈的
     # 插桩覆盖率 job 恢复为 dev 默认值。
-    - name: Compile uc-infra without the mobile optimization override
+    - name: Compile uc-infra-* crates without the mobile optimization override
       if: inputs.fast-compile-infra == 'true'
       shell: bash
       run: |
         cargo_home="${CARGO_HOME:-$HOME/.cargo}"
         mkdir -p "$cargo_home"
-        printf '\n[profile.dev.package.uc-infra]\nopt-level = 0\n' >> "$cargo_home/config.toml"
+        for crate in local crypto security storage content p2p profile; do
+          printf '\n[profile.dev.package.uc-infra-%s]\nopt-level = 0\n' "$crate" >> "$cargo_home/config.toml"
+        done

@@ -16,6 +16,9 @@ mod removal_convergence;
 #[path = "space_membership_auto_pairing_e2e/clipboard_trace.rs"]
 mod clipboard_trace;
 
+#[path = "space_membership_auto_pairing_e2e/clipboard_connectivity.rs"]
+mod clipboard_connectivity;
+
 #[path = "space_membership_auto_pairing_e2e/pairing.rs"]
 mod pairing;
 
@@ -30,6 +33,9 @@ mod space_switch;
 
 #[path = "space_membership_auto_pairing_e2e/membership_history.rs"]
 mod membership_history;
+
+#[path = "space_membership_auto_pairing_e2e/group_update_delivery.rs"]
+mod group_update_delivery;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};

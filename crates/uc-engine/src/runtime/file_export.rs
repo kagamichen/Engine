@@ -9,7 +9,7 @@ use crate::{
     HostFileAccess, HostFileHandle, OperationResult,
 };
 use uc_application::facade::FileExportDestination;
-use uc_infra::fs::export_file_reader::FsExportFileReader;
+use uc_infra_local::fs::export_file_reader::FsExportFileReader;
 
 const MAX_HOST_WRITE_BYTES: usize = 64 * 1024;
 

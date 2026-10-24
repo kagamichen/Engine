@@ -7,6 +7,25 @@
 Core 只产生新记录与副作用清单；Application 执行能力并保存推进结果。成员历史及其效果、关系核对和设备组密钥投递
 各有持久状态，统一维护流程负责触发它们，但这些状态没有合并成一条配对记录。
 
+## 配对地址材料的采样与恢复
+
+Joiner 初始材料在身份事实签名前，从当前 Iroh endpoint 采样地址；身份公钥和地址来自同一次快照。
+Sponsor 在生成 Candidate 时从自身 endpoint 采样 continuation route。两者都不缓存会话组装时的地址，
+因此配对前才就绪的 Relay 可以进入协议材料。Engine 只注入动作专属材料 port，不编排采样步骤。Iroh Endpoint、地址快照和编码均封装在 P2P adapter 中；Profile 的完整材料能力只消费不透明传输材料。
+
+Relay 尚未就绪时使用当前已有地址，显式 LAN-only 不需等待 Relay；材料生成不新增无界等待。
+编码失败保留 source chain，由材料能力返回失败，不回落旧快照。签名或持久化后的材料保持不变，
+重放与重启继续使用原协议材料；之后的稳定地址补齐仍由已确认成员历史更新负责。
+这不保证在 Relay 后续变化、真实 NAT 或平台挂起条件下永远可达。
+
+## Initial response interruption and recovery
+
+Before `OpaqueResponse`, a response-stream reset or connection loss is a transport failure. It is not evidence that the password was rejected. The P2P adapter returns `SpaceAdmissionTransportError::Unavailable` and preserves the original wire error. Application owns the persisted retry schedule and the existing five-minute admission deadline. A retry does not extend that deadline.
+
+Recognized application close codes take precedence over the transport classification. Explicit authentication rejection, session-unavailable and busy deferral, peer-upgrade results, and the response timeout retain their existing meanings. This rule does not change the existing fallback for malformed responses or unrecognized application close codes.
+
+The production session dispatcher and the directly registered admission handler use the same handshake observation function. It records the sponsor-side handshake result without selecting a session generation before the handshake. Session selection and leases remain in `accept`. A client-side connection result alone does not prove that the sponsor completed its handshake or processed the admission request.
+
 ## 先分清三个完成边界
 
 ```mermaid
@@ -107,7 +126,14 @@ flowchart TD
 
 图中的阶段集合不是“任意状态都能转换”：精确守卫以 Core 转换为准。特别是 `Active` 不在普通本机终止集合，
 正式提交后的 `Completed` 不因配对时钟到期回滚。
-没有 `attempt_timeline` 的旧 Sponsor 记录不会进入 `SponsorExpired`，需按收尾表中的恢复规则处理。`Superseded` 保留 `Initiated`、`Authenticated`、`Candidate` 子类；
+没有 `attempt_timeline` 的旧 Sponsor 记录不会进入 `SponsorExpired`：它没有期限，计时永远不会结束它，却仍然阻止所有新的准入。
+恢复流程按记录与成员账本事实把它收尾为 `Terminal.SponsorLegacyClosed`（不使用时间猜测，不删除记录，邀请占用保持已消费）：
+
+- `Accepted`、`Candidate` 不会写账本，直接关闭，无成员；
+- `Committed`、`Applied`：账本里没有该次准入的候选事件则关闭，无成员；已有则关闭并带 `Unconfirmed` 确认摘要，成员保留；
+- 账本暂不可读时保持原记录，下一轮恢复重新评估。
+
+`SponsorLegacyClosed` 不重用 `Completed` 或 `Rejected(Sponsor)`，因为二者都需要旧记录里不存在的真实回复证据。它以追加变体写入 V1 状态枚举，不新增记录版本。`Superseded` 保留 `Initiated`、`Authenticated`、`Candidate` 子类；
 取代按 `attempt_digest` 分流，而不是按是否有期限：
 
 - 无期限且无 digest 的旧记录，在 `Prepared`、`Committed`、`Applied`、`Activating` 或 `Cancelling` 时保存为 `Terminated`，原因是 `Cancelled`；
@@ -200,7 +226,7 @@ flowchart TD
 | 配对尝试 | `AdmissionAttemptTimeline`（协议契约，非本机收尾期限）：开始时间加 300 秒；解析、认证、重连和重启不续期 | 可终止阶段先本机保存终态，再处理网络；已正式完成不回滚 |
 | Joiner 放弃通知 | `SettlementWindow::until(attempt 截止时间)`，不另开窗口 | 无本机切换待办时，到期、缺少期限或通知协议不是当前版本可结束待发送项，保留围栏 |
 | 被移除对端的移除通知 | 账本 `PeerLink::Departing`：窗口起点为移除提交时刻，300 秒到期（旧记录迁移时从迁移时刻重新计时） | 到期由 Worker 以“离开窗口到期”输入交回 Owner 删除该对端；不宣称对端确认 |
-| 设备组密钥更新 | store 的持久 `next_attempt_at_ms` 与失败分类 | 离线/传输失败延期，稳定拒绝需处理；对端刚与本机成功交换成员历史时，发给它的未拒绝更新不等延期到期即投递；没有共用配对五分钟终止规则 |
+| 设备组密钥更新 | store 的持久 `next_attempt_at_ms` 与失败分类 | 离线、传输失败与接收方暂时不可用延期；接收方明确拒绝需处理，不自动重发；旧协议或升级前遗留的无原因拒绝只在该设备重新通过认证且重新评估间隔已过时重发一次，成功应用才清除；对端刚与本机成功交换成员历史或重新上线时，发给它的非拒绝更新不等延期到期即投递；没有共用配对五分钟终止规则 |
 
 `recover_pending` 负责准入续跑与准入清理；成员维护先恢复准入，再由 `MembershipWorker` 按账本待办依次推进成员效果、冲突恢复、
 密钥投递，最后执行移除通知、决定投递、离开到期与历史同步。成员效果先于移除通知执行。

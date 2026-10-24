@@ -87,10 +87,13 @@ mod tests {
     ];
 
     /// 迁移及其后补日志时新增的可见文本字段：`Literal` 字段只接受 `&'static str`（编译期保证是固定字面量），
-    /// `existing_status` 是文件传输状态的已审定词表。
+    /// `existing_status` 是文件传输状态、`channel` 是 Direct/Relay/Unknown 的已审定枚举词表。
     const NEWLY_VISIBLE: &[&str] = &[
         "ack",
+        "addr_kind",
+        "attempt_ref",
         "cause",
+        "channel",
         "context",
         "dependency",
         "emitter",
@@ -106,7 +109,9 @@ mod tests {
         "reject_reason",
         "rollback_target",
         "source_class",
+        "sqlite_result",
         "storage_generation",
+        "tag_id",
         "task",
         "trigger",
         "worker",

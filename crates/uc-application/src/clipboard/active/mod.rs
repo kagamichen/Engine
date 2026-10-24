@@ -7,9 +7,11 @@
 //! single lifecycle seam for worker startup, late restore-source attachment,
 //! and coordinated shutdown.
 
+use crate::clipboard::active::transport::ActivePullPreparationPort;
 mod current;
 mod lifecycle;
 mod reconcile;
+pub(crate) mod transport;
 
 pub use lifecycle::{ActiveClipboardLifecycle, ActiveClipboardLifecycleError};
 
@@ -18,6 +20,7 @@ pub use reconcile::{
     ActiveClipboardReconcileOutcome,
 };
 
+use crate::clipboard::sync::apply_inbound::InboundActivationOwner;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,11 +30,11 @@ use tracing::instrument;
 use uc_core::clipboard::{ActiveClipboardState, ClipboardContentCategorySet};
 use uc_core::ids::{DeviceId, EntryId};
 use uc_core::ports::clipboard::{
-    ActiveClipboardDispatchPort, ActiveClipboardPullClientPort, ActiveClipboardPullServePort,
-    ActiveClipboardReceiverPort, AdvanceActiveClipboardPort, CheckEntryAvailabilityPort,
-    ClipboardPayloadResolverPort, ClipboardSelectionRepositoryPort, EntryFileSetRepositoryPort,
-    FindEntryIdBySnapshotHashPort, GetClipboardEntryPort, GetRepresentationPort,
-    LoadActiveClipboardPort, TouchClipboardEntryPort, UpdateRepresentationProcessingResultPort,
+    ActiveClipboardDispatchPort, ActiveClipboardPullClientPort, ActiveClipboardReceiverPort,
+    AdvanceActiveClipboardPort, CheckEntryAvailabilityPort, ClipboardPayloadResolverPort,
+    ClipboardSelectionRepositoryPort, EntryFileSetRepositoryPort, FindEntryIdBySnapshotHashPort,
+    GetClipboardEntryPort, GetRepresentationPort, LoadActiveClipboardPort, TouchClipboardEntryPort,
+    UpdateRepresentationProcessingResultPort,
 };
 use uc_core::ports::security::TransferCipherPort;
 use uc_core::ports::{
@@ -54,7 +57,9 @@ use crate::clipboard::sync::active_state::apply_inbound::{
     ActiveClipboardConvergedEvent, ApplyInboundActiveClipboardStateUseCase,
     InboundPulledContentStore, InboundPulledContentStoreError, InboundPulledContentStoreOutcome,
 };
-use crate::clipboard::sync::active_state::fanout::fan_out_active_state;
+use crate::clipboard::sync::active_state::fanout::{
+    fan_out_active_state, ActiveStateBroadcastTrigger,
+};
 use crate::clipboard::sync::active_state::serve_pull::{
     ActiveClipboardPullServeDeps, ActiveClipboardPullServeUseCase,
 };
@@ -75,6 +80,7 @@ use crate::facade::host_event::{ClipboardHostEvent, ClipboardOriginKind, HostEve
 /// `SnapshotReconstructor` at facade construction. Shared by the
 /// inbound / resend / restore paths ([`ActiveClipboardDeps`]) and the pull
 /// serve path ([`ActiveClipboardPullServeFacadeDeps`]).
+#[derive(Clone)]
 pub struct ClipboardSnapshotDeps {
     pub entry_repo: Arc<dyn GetClipboardEntryPort>,
     pub selection_repo: Arc<dyn ClipboardSelectionRepositoryPort>,
@@ -153,7 +159,7 @@ pub struct ActiveClipboardDeps {
 }
 
 /// Dependencies for the standalone pull serve port
-/// ([`build_active_clipboard_pull_serve_port`]). Built separately from the
+/// ([`build_active_clipboard_pull_preparation`]). Built separately from the
 /// facade because the serve port must be registered on the pull accept handler
 /// before the node spawns, whereas the facade (which owns the inbound loop) is
 /// assembled after.
@@ -181,9 +187,9 @@ pub struct ActiveClipboardPullServeFacadeDeps {
 ///
 /// Standalone (not a facade method) so bootstrap can register it on the pull
 /// accept handler before the node spawns.
-pub fn build_active_clipboard_pull_serve_port(
+pub fn build_active_clipboard_pull_preparation(
     deps: ActiveClipboardPullServeFacadeDeps,
-) -> Arc<dyn ActiveClipboardPullServePort> {
+) -> Arc<dyn ActivePullPreparationPort> {
     let reconstructor = deps.snapshot.into_reconstructor();
     let blob_publisher: Arc<dyn OutboundBlobPublishGateway> = deps.blob_publisher;
     Arc::new(ActiveClipboardPullServeUseCase::new(
@@ -330,6 +336,7 @@ impl ActiveClipboardFacade {
             &self.send_gate,
             &state,
             &categories,
+            ActiveStateBroadcastTrigger::LocalActivation,
         )
         .await;
     }
@@ -419,6 +426,7 @@ impl InboundPulledContentStore for PulledContentStore {
                 // the intent never reaches the clipboard. `RemotePush` states
                 // the truth of where the content came from.
                 resurface_intent: ClipboardWriteIntent::RemotePush,
+                activation_owner: InboundActivationOwner::Inbound,
             })
             .await
             .map_err(|err| InboundPulledContentStoreError::Store(anyhow::Error::from(err)))?;

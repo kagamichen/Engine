@@ -19,9 +19,9 @@ use uc_application::facade::{
     RecoverSpaceSessionError, RuntimeLifecycle,
 };
 use uc_core::{FileTransferCancellationReason, TaskRegistry};
-use uc_infra::fs::{FsAtomicPublisher, FsHiddenPathMarker, FsInboundFileTarget};
-use uc_infra::network::iroh::{IrohNode, IrohSessionBuilder, PreparedIrohSession};
-use uc_infra::space::RuntimeSpaceAccessAdapter;
+use uc_infra_local::fs::{FsAtomicPublisher, FsHiddenPathMarker, FsInboundFileTarget};
+use uc_infra_p2p::network::iroh::{IrohNode, IrohSessionBuilder, PreparedIrohSession};
+use uc_infra_profile::space::ProfileLocalResources;
 use uc_observability_contract::diagnostics::connectivity::{
     observe_local_result, record_session_lock_wait, LocalWorkStep, SessionTransition,
     SessionTransitionResult,
@@ -206,7 +206,7 @@ struct ProductionSessionFactory {
     relay_fallback_override: Option<bool>,
     iroh_bind_port_override: Option<u16>,
     #[cfg(feature = "dev-tools")]
-    network_partition_gate: uc_infra::network::iroh::IrohNetworkPartitionGate,
+    network_partition_gate: uc_infra_p2p::network::iroh::IrohNetworkPartitionGate,
     #[cfg(feature = "dev-tools")]
     joiner_final_confirmation_gate: Arc<JoinerFinalConfirmationGate>,
     #[cfg(feature = "dev-tools")]
@@ -365,7 +365,7 @@ fn session_lifecycle_error_type(error: &EngineError) -> DiagnosticErrorType {
 impl SessionSupervisor {
     pub(super) fn new(
         application: ApplicationAssembly,
-        security: Arc<RuntimeSpaceAccessAdapter>,
+        local_resources: Arc<ProfileLocalResources>,
     ) -> Arc<Self> {
         use uc_observability_contract::diagnostics::connectivity::{
             LocalDiagnosticSource, NetworkRecorder, SourceCapability, SourceCollection,
@@ -390,7 +390,7 @@ impl SessionSupervisor {
             admission_recovery: StdMutex::new(None),
             refresh_hold: StdMutex::new(None),
             coordinator: application
-                .runtime_lifecycle(Arc::new(SessionWork(owner.clone())), security),
+                .runtime_lifecycle(Arc::new(SessionWork(owner.clone())), local_resources),
         })
     }
 
@@ -405,7 +405,7 @@ impl SessionSupervisor {
         relay_fallback_override: Option<bool>,
         iroh_bind_port_override: Option<u16>,
         #[cfg(feature = "dev-tools")]
-        network_partition_gate: uc_infra::network::iroh::IrohNetworkPartitionGate,
+        network_partition_gate: uc_infra_p2p::network::iroh::IrohNetworkPartitionGate,
         #[cfg(feature = "dev-tools")] joiner_final_confirmation_gate: Arc<
             JoinerFinalConfirmationGate,
         >,

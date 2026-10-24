@@ -5,9 +5,19 @@
 //! Clipboard、Blob 与文件传输对象图及其关闭顺序均由 Application 持有；
 //! [`SyncSessionAssembly`] 只拥有当前 Space 会话的进度翻译 worker。
 
+use super::observability::{self, observe_peer_reachability};
 mod outbound_progress;
+#[cfg(all(test, feature = "dev-tools"))]
+use crate::testing::active_pull_publication::{decorate_blob, decorate_preparation};
+#[cfg(all(test, feature = "dev-tools", target_os = "linux"))]
+use crate::testing::directory_probe;
+#[cfg(all(test, feature = "dev-tools"))]
+use crate::testing::receive_exports;
+#[cfg(all(test, feature = "dev-tools", target_os = "linux"))]
+use crate::testing::receive_streams;
 
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::Instant;
 
@@ -18,32 +28,39 @@ use outbound_progress::OutboundProgressRuntime;
 use crate::assembly::deps::SyncEngineDeps;
 #[cfg(feature = "dev-tools")]
 use crate::dev::{
-    ControlledSpaceAdmissionTransport, GatedJoinerActivation, JoinerFinalConfirmationGate,
+    ControlledSpaceAdmissionTransport, FaultableGroupUpdateReceiver, FaultableGroupUpdateWire,
+    GatedJoinerActivation, GatedMembershipHistoryEndpoint, JoinerFinalConfirmationGate,
     RecordedGroupUpdateDispatch, RecordedMembershipHistoryExchange,
 };
 use uc_application::deps::{
     ApplicationClipboardAdapters, ApplicationNetworkAdapters, ApplicationNetworkBinding,
-    ApplicationSpaceAdapters, ClipboardReceiverPort, CurrentSpaceMemberScopePort, LifecycleError,
-    PeerIdentityDirectoryPort, SpaceAdmissionAdapters, SpaceMembershipAdapters,
-    SpaceRuntimeAdapters,
+    ApplicationSpaceAdapters, ApplyGroupUpdatePort, BlobDownloadResources, BlobTransport,
+    ClipboardReceiverPort, ConnectivityManager, ConnectivityPolicy, GroupUpdateEndpoint,
+    GroupUpdateLocalWorkPort, GroupUpdateReceiverPort, GroupUpdateWirePort, HistoryWirePort,
+    IdleRetentionPolicy, LifecycleError, MembershipHistoryReceiver, MembershipHistoryTransport,
+    PeerIdentityDirectoryPort, PeerReachabilityTransport, PeerReachabilityTransportPorts,
+    SpaceAdmissionAdapters, SpaceMembershipAdapters, SpaceRuntimeAdapters,
 };
 use uc_application::facade::ApplicationAssembly;
 use uc_core::file_transfer::FileTransferCancellationReason;
-use uc_core::membership::{ContentExchangeGatePort, PeerAdmissionPort};
+use uc_core::membership::{GroupUpdateDispatchPort, PeerAdmissionPort};
 use uc_core::ports::{
     ActiveClipboardDispatchPort, ActiveClipboardReceiverPort, ClipboardDispatchPort,
-    ConnectionChannelPort, LocalIdentityPort, PeerReachabilityPort,
+    ConnectionChannelPort, LocalIdentityPort,
 };
-use uc_infra::fs::{
+use uc_infra_local::fs::{
     FsAtomicPublisher, FsDirectoryStagingCleaner, FsHiddenPathMarker, FsInboundFileTarget,
 };
-use uc_infra::network::iroh::{
-    encode_space_admission_route, ActiveClipboardHandlers, ActiveClipboardPullHandlers,
-    BlobHandlers, ClipboardHandlers, GroupUpdateHandlers, IrohIdentityStore, IrohNodeError,
-    IrohSessionBuilder, PreparedIrohSession, TransferProgressHandlers,
+use uc_infra_p2p::network::iroh::{
+    blob_exchange::IrohBlobSourceResolver,
+    connectivity::{ConnectivityProfile, PeerReachabilityWire},
+    group_update_adapter::{GroupUpdateWire, IrohGroupUpdateAdapter, SessionGroupUpdateLocalWork},
+    ActiveClipboardHandlers, ActiveClipboardPullHandlers, BlobHandlers, ClipboardHandlers,
+    IrohIdentityStore, IrohNodeError, IrohSessionBuilder, MembershipHistoryWire,
+    PreparedIrohSession, SessionMembershipHistoryLocalWork, TransferProgressHandlers,
 };
-use uc_infra::security::Sha256IdentityFingerprintFactory;
-use uc_infra::space::{
+use uc_infra_profile::security::Sha256IdentityFingerprintFactory;
+use uc_infra_profile::space::{
     DefaultJoinerActivationExecutor, DefaultJoinerActivationPreparation,
     DefaultJoinerAppliedPreparation, DefaultJoinerCancellationPreparation,
     DefaultJoinerCandidatePreparation, DefaultJoinerInvitationPreparation,
@@ -55,27 +72,7 @@ use uc_infra::space::{
     MembershipActivationAdapter, MembershipMemberFactsAdapter, MembershipNetworkGate,
     OpenMlsHistoricalSignatureVerifier,
 };
-use uc_observability_contract::uc_info;
-
-struct CurrentMemberContentGate {
-    scope: Arc<dyn CurrentSpaceMemberScopePort>,
-}
-
-impl CurrentMemberContentGate {
-    fn new(scope: Arc<dyn CurrentSpaceMemberScopePort>) -> Self {
-        Self { scope }
-    }
-}
-
-#[async_trait::async_trait]
-impl ContentExchangeGatePort for CurrentMemberContentGate {
-    async fn is_locally_removed(&self, device_id: &uc_core::ids::DeviceId) -> bool {
-        let Ok(scope) = self.scope.snapshot().await else {
-            return true;
-        };
-        !scope.local_member_active || !scope.usable_peer_device_ids.contains(device_id)
-    }
-}
+use uc_observability_contract::{diagnostics::DiagnosticTaskKind, uc_info};
 
 #[cfg(not(feature = "lan-compat"))]
 struct UnavailableMobileDeviceLookup;
@@ -142,11 +139,6 @@ pub enum SyncSessionPreparationError {
     IrohNode(#[from] IrohNodeError),
     #[error(transparent)]
     ApplicationUpgrade(#[from] uc_application::facade::ApplicationUpgradeError),
-    #[error("failed to assemble the Space application")]
-    ApplicationAssembly {
-        #[source]
-        source: anyhow::Error,
-    },
 }
 
 /// 从已完成的 Application factory 与 Engine adapter 构造共享 Iroh 网络。
@@ -178,7 +170,7 @@ pub async fn prepare_sync_session(
         Arc::clone(&space_setup.settings),
         Arc::clone(&space_setup.fingerprint),
     );
-    let membership_history_exchange_adapter = builder.build_membership_history_exchange_adapter(
+    let verified_peer_address_refresh = builder.build_verified_peer_address_refresh(
         Arc::clone(&space_setup.peer_addr_repo),
         Arc::clone(&space_setup.clock),
     );
@@ -187,38 +179,128 @@ pub async fn prepare_sync_session(
     let (known_peer_contact_tx, known_peer_contacts) = broadcast::channel(64);
     // Presence is installed before the convergence owner is assembled so the
     // owner can expose reachability as an independent product fact.
-    let peer_reachability: Arc<dyn PeerReachabilityPort> = builder.install_peer_reachability(
-        Arc::clone(&space_setup.peer_addr_repo),
-        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerIdentityDirectoryPort>,
-        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerAdmissionPort>,
-        Arc::clone(&space_setup.fingerprint),
-        Arc::clone(&space_setup.clock),
+    let (presence_deps, presence_environment) = builder.presence_connectivity_deps(
+        space_setup.peer_addr_repo.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.fingerprint.clone(),
+    );
+    let presence_manager = ConnectivityManager::new(
+        presence_deps.backend,
+        presence_deps.admission,
+        ConnectivityPolicy {
+            presence_retention: true,
+            task_kind: DiagnosticTaskKind::PresenceConnectivityWorker,
+            inbound_per_connection: 2,
+            flights_per_session: 4,
+            ..ConnectivityPolicy::default()
+        },
+    );
+    let presence_owner = PeerReachabilityTransport::new(
+        presence_manager,
+        space_setup.peer_access.clone(),
+        PeerReachabilityTransportPorts {
+            wire: Arc::new(PeerReachabilityWire),
+            environment: presence_environment,
+        },
+        space_setup.clock.clone(),
         known_peer_contact_tx,
-    )?;
+    );
+    builder.install_peer_reachability(presence_owner.clone())?;
+    let peer_reachability = observe_peer_reachability(presence_owner);
+    let history_connectivity = builder.history_connectivity_deps(
+        space_setup.peer_addr_repo.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.fingerprint.clone(),
+        peer_reachability.clone(),
+    );
+    let history_binding = history_connectivity.admission.clone();
+    let history_manager = ConnectivityManager::new(
+        history_connectivity.backend,
+        history_connectivity.admission,
+        ConnectivityPolicy {
+            task_kind: DiagnosticTaskKind::MembershipHistoryConnectivityWorker,
+            accepted_stream_timeout: Some(Duration::from_secs(10)),
+            idle_retention: Some(IdleRetentionPolicy {
+                timeout: Duration::from_secs(30),
+                capacity: 16,
+            }),
+            ..ConnectivityPolicy::default()
+        },
+    );
+    let history_wire: Arc<dyn HistoryWirePort> = Arc::new(MembershipHistoryWire);
+    let complete_history_transport = Arc::new(MembershipHistoryTransport::new(
+        history_manager.clone(),
+        history_wire.clone(),
+    ));
     // Phase 96 INDIC-01:连接通道单一真相源。复用同一 endpoint +
     // peer_addr_repo,纯读 adapter 不装 ALPN handler。
     let connection_channel: Arc<dyn ConnectionChannelPort> =
         builder.install_connection_channel(Arc::clone(&space_setup.peer_addr_repo));
-    let GroupUpdateHandlers {
-        dispatch: group_update_dispatch,
-    } = builder.install_group_updates(
-        Arc::clone(&space_setup.peer_addr_repo),
-        Arc::clone(&space_setup.space_access.group_revocation),
-    )?;
-    // Slice 2 Phase 2 · T10:同一节点装第三个 ALPN(剪切板同步)。dispatch
-    // 复用 endpoint + peer_addr_repo,与 peer_reachability 共享 NAT/relay 映射;
-    // receiver handler 通过身份目录把 `Connection::remote_id()` 反查
-    // 成 DeviceId 再喂给应用层 broadcast。同样必须在 `spawn` 前装。
-    let ClipboardHandlers {
-        dispatch: clipboard_dispatch,
-        receiver: clipboard_receiver,
-    } = builder.install_clipboard(
+    let group_update_receiver = GroupUpdateEndpoint::unbound();
+    #[cfg(feature = "dev-tools")]
+    let legacy_group_updates = joiner_final_confirmation_gate
+        .space_work_control()
+        .uses_legacy_group_protocol();
+    #[cfg(not(feature = "dev-tools"))]
+    let legacy_group_updates = false;
+    let group_profile = if legacy_group_updates {
+        ConnectivityProfile::LegacyGroupUpdate
+    } else {
+        ConnectivityProfile::GroupUpdate
+    };
+    let group_connectivity = builder.connectivity_deps(
+        group_profile,
+        space_setup.peer_addr_repo.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.fingerprint.clone(),
+        peer_reachability.clone(),
+    );
+    let group_manager = ConnectivityManager::new(
+        group_connectivity.backend,
+        group_connectivity.admission,
+        ConnectivityPolicy::default(),
+    );
+    let wire: Arc<dyn GroupUpdateWirePort> = Arc::new(GroupUpdateWire);
+    #[cfg(feature = "dev-tools")]
+    let wire: Arc<dyn GroupUpdateWirePort> = Arc::new(FaultableGroupUpdateWire::new(
+        wire,
+        joiner_final_confirmation_gate.space_work_control(),
+    ));
+    let group_update_dispatch: Arc<dyn GroupUpdateDispatchPort> = Arc::new(
+        IrohGroupUpdateAdapter::new(group_manager.clone(), wire.clone()),
+    );
+    let group_update_wire = wire;
+    let group_update_local_work: Arc<dyn GroupUpdateLocalWorkPort> =
+        Arc::new(SessionGroupUpdateLocalWork);
+    let complete_group_receiver: Arc<dyn GroupUpdateReceiverPort> = group_update_receiver.clone();
+    let group_update_apply: Arc<dyn ApplyGroupUpdatePort> = space_setup.security_lifecycle.clone();
+    #[cfg(feature = "dev-tools")]
+    let group_update_apply: Arc<dyn ApplyGroupUpdatePort> =
+        Arc::new(FaultableGroupUpdateReceiver::new(
+            group_update_apply,
+            joiner_final_confirmation_gate.space_work_control(),
+        ));
+    // Engine 组装完整连接负责人；业务调用方只持有发送与接收意图端口。
+    let connectivity = builder.connectivity_deps(
+        ConnectivityProfile::Clipboard,
         Arc::clone(&space_setup.peer_addr_repo),
         Arc::clone(&space_setup.peer_access) as Arc<dyn PeerIdentityDirectoryPort>,
         Arc::clone(&space_setup.peer_access) as Arc<dyn PeerAdmissionPort>,
         Arc::clone(&space_setup.fingerprint),
         Arc::clone(&peer_reachability),
-    )?;
+    );
+    let manager = ConnectivityManager::new(
+        connectivity.backend,
+        connectivity.admission,
+        ConnectivityPolicy::default(),
+    );
+    let ClipboardHandlers {
+        dispatch: clipboard_dispatch,
+        receiver: clipboard_receiver,
+    } = builder.install_clipboard(manager)?;
     let clipboard_dispatch: Arc<dyn ClipboardDispatchPort> = clipboard_dispatch;
     let clipboard_receiver: Arc<dyn ClipboardReceiverPort> = clipboard_receiver;
     // Install the active-clipboard state ALPN (0xC3) as an independent
@@ -228,15 +310,26 @@ pub async fn prepare_sync_session(
     // both the inbound receiver (broadcast of peer observations) and the
     // outbound dispatch port (re-broadcast of converged state), sharing the
     // endpoint + peer_addr_repo like install_clipboard.
+    let active_connectivity = builder.connectivity_deps(
+        ConnectivityProfile::ActiveClipboardState,
+        space_setup.peer_addr_repo.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.fingerprint.clone(),
+        peer_reachability.clone(),
+    );
+    let active_manager = ConnectivityManager::new(
+        active_connectivity.backend,
+        active_connectivity.admission,
+        ConnectivityPolicy {
+            inbound_per_connection: 1,
+            ..ConnectivityPolicy::default()
+        },
+    );
     let ActiveClipboardHandlers {
         dispatch: active_clipboard_dispatch,
         receiver: active_clipboard_receiver,
-    } = builder.install_active_clipboard(
-        Arc::clone(&space_setup.peer_addr_repo),
-        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerIdentityDirectoryPort>,
-        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerAdmissionPort>,
-        Arc::clone(&space_setup.fingerprint),
-    )?;
+    } = builder.install_active_clipboard(active_manager)?;
     let active_clipboard_dispatch: Arc<dyn ActiveClipboardDispatchPort> = active_clipboard_dispatch;
     let active_clipboard_receiver: Arc<dyn ActiveClipboardReceiverPort> = active_clipboard_receiver;
     // 反向"传输进度"通道(receiver → sender):同一节点装第四个 ALPN。
@@ -253,28 +346,55 @@ pub async fn prepare_sync_session(
         Arc::clone(&space_setup.fingerprint),
     )?;
 
-    // Slice 3 Phase 1:同一节点装第五个 ALPN(iroh-blobs)。BlobReference
-    // 是 sqlite 仓储,不跟 router 绑定;这里只拿传输 port。
-    let BlobHandlers { blob_transfer } = builder
-        .install_blobs(space_setup.iroh_blob_store_dir.clone())
+    #[cfg(all(test, feature = "dev-tools"))]
+    let outbound_progress_reporter = receive_exports::decorate_reporter(
+        &space_setup.iroh_blob_store_dir,
+        outbound_progress_reporter,
+    );
+
+    // 同一存储上的交换能力交给唯一 Application 负责人；Router 不再由 SDK 自管。
+    // SQLite 引用与纯本地存储能力交给 transfer，完整条目提交仍归既有接收权威。
+    let blob_connectivity = builder.connectivity_deps(
+        ConnectivityProfile::Blob,
+        Arc::clone(&space_setup.peer_addr_repo),
+        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerIdentityDirectoryPort>,
+        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerAdmissionPort>,
+        Arc::clone(&space_setup.fingerprint),
+        Arc::clone(&peer_reachability),
+    );
+    #[cfg(all(test, feature = "dev-tools", target_os = "linux"))]
+    let stream_fixture_path = space_setup.iroh_blob_store_dir.clone();
+    let BlobHandlers {
+        blob_transfer,
+        transport: blob_transport,
+        read_store: blob_read_store,
+    } = builder
+        .install_blobs(
+            space_setup.iroh_blob_store_dir.clone(),
+            move |exchange, lifecycle| {
+                #[cfg(all(test, feature = "dev-tools", target_os = "linux"))]
+                let exchange = receive_streams::decorate(&stream_fixture_path, exchange);
+                BlobTransport::new(
+                    blob_connectivity.backend,
+                    blob_connectivity.admission,
+                    exchange,
+                    lifecycle,
+                )
+            },
+        )
         .await?;
+    #[cfg(all(test, feature = "dev-tools"))]
+    let blob_transfer = decorate_blob(&space_setup.iroh_blob_store_dir, blob_transfer);
+    #[cfg(all(test, feature = "dev-tools"))]
+    let blob_read_store =
+        receive_exports::decorate(&space_setup.iroh_blob_store_dir, blob_read_store);
+
+    let blob_read_store = observability::observe_blob_exports(blob_read_store);
 
     // Application 先构造认证 endpoint；Space 持续维护要等 Router 就绪后
     // 才由 ApplicationRuntime 启动。
-    let endpoint_addr = builder.local_endpoint_addr();
-    let endpoint_addr_blob = builder.local_endpoint_addr_blob()?;
-    let continuation_route =
-        encode_space_admission_route(&endpoint_addr, None).map_err(|source| {
-            SyncSessionPreparationError::ApplicationAssembly {
-                source: anyhow::Error::new(source).context("failed to encode the admission route"),
-            }
-        })?;
-    let identity_fingerprint = space_setup
-        .fingerprint
-        .from_public_key(endpoint_addr.id.as_bytes())
-        .map_err(|source| SyncSessionPreparationError::ApplicationAssembly {
-            source: source.context("failed to derive the endpoint identity fingerprint"),
-        })?;
+    let transport_material =
+        builder.admission_transport_material(Arc::clone(&space_setup.fingerprint));
     let historical_signatures = Arc::new(OpenMlsHistoricalSignatureVerifier);
     let membership_network_gate = MembershipNetworkGate::active();
     let admission_transport: Arc<dyn uc_application::deps::SpaceAdmissionTransportPort> =
@@ -290,7 +410,7 @@ pub async fn prepare_sync_session(
         ));
     let membership_history_transport = Arc::new(GatedMembershipHistoryExchange::new(
         Arc::clone(&membership_network_gate),
-        Arc::clone(&membership_history_exchange_adapter),
+        Arc::clone(&complete_history_transport),
     ));
     #[cfg(feature = "dev-tools")]
     let membership_history_synchronization_transport =
@@ -313,9 +433,7 @@ pub async fn prepare_sync_session(
         joiner_start_material: Arc::new(DefaultJoinerStartMaterial::new(
             local_device_id,
             Arc::clone(&space_setup.settings),
-            identity_fingerprint,
-            endpoint_addr.id.as_bytes().to_vec(),
-            endpoint_addr_blob,
+            transport_material.clone(),
         )),
         joiner_start_state: space_setup.admission_state.clone()
             as Arc<dyn uc_application::deps::JoinerStartStatePort>,
@@ -329,7 +447,7 @@ pub async fn prepare_sync_session(
             as Arc<dyn uc_application::deps::SponsorAdmissionStatePort>,
         prepare_sponsor_candidate: Arc::new(DefaultSponsorCandidatePreparation::new(
             local_device_id,
-            continuation_route,
+            transport_material.clone(),
             Arc::clone(&space_setup.current_member_signatures),
             historical_signatures.clone(),
             Arc::clone(&space_setup.space_access.prepare_sponsor_admission_security),
@@ -378,62 +496,73 @@ pub async fn prepare_sync_session(
         current_join_status: space_setup.admission_state.clone()
             as Arc<dyn uc_application::deps::LoadCurrentJoinStatusPort>,
     };
-    let membership = crate::assembly::observability::observe_membership(SpaceMembershipAdapters {
-        membership_records: space_setup.membership_ledger.clone()
-            as Arc<dyn uc_application::deps::MembershipRecordStorePort>,
-        peer_access: Arc::clone(&space_setup.peer_access),
-        historical_membership_signatures: historical_signatures.clone(),
-        current_member_signatures: Arc::clone(&space_setup.current_member_signatures),
-        membership_identity: membership_identity.clone(),
-        membership_announcement: membership_identity,
-        device_trust_observations: Arc::new(DeviceTrustObservationsAdapter::new(
-            Arc::clone(&space_setup.member_repo),
-            Arc::clone(&peer_reachability),
-        )),
-        membership_history_transport: membership_history_synchronization_transport,
-        verified_peer_address_refresh: membership_history_exchange_adapter.clone(),
-        membership_branch_recovery_channel,
-        membership_branch_recovery_recipient: Arc::clone(
-            &space_setup
-                .space_access
-                .prepare_membership_branch_recovery_recipient,
-        ),
-        membership_branch_transition: Arc::new(DefaultMembershipBranchTransitionPreparation::new(
-            Arc::clone(&space_setup.active_generation_manifest_store),
-        )),
-        membership_branch_transition_executor: Arc::clone(
-            &space_setup.membership_branch_transition_executor,
-        ),
-        membership_branch_recovery_material: Arc::clone(
-            &space_setup
-                .space_access
-                .prepare_membership_branch_recovery_material,
-        ),
-        apply_membership_member_facts: Arc::new(MembershipMemberFactsAdapter::new(
-            Arc::clone(&space_setup.member_repo),
-            Arc::clone(&space_setup.trusted_peer_repo),
-            Arc::clone(&space_setup.peer_addr_repo),
-            Arc::clone(&space_setup.device_identity),
-            Arc::clone(&space_setup.clock),
-        )),
-        apply_membership_security: membership_security,
-        activate_membership_effect: Arc::new(MembershipActivationAdapter::new(Arc::clone(
-            &peer_reachability,
-        ))),
-        restricted_membership_delivery: membership_history_transport,
-        group_update_store: Arc::clone(&space_setup.space_access.group_revocation),
-        group_update_dispatch: {
-            #[cfg(feature = "dev-tools")]
-            let dispatch = Arc::new(RecordedGroupUpdateDispatch::new(
-                group_update_dispatch,
-                joiner_final_confirmation_gate.space_work_control(),
-            ));
-            #[cfg(not(feature = "dev-tools"))]
-            let dispatch = group_update_dispatch;
-            dispatch
-        },
-        membership_network_activity: membership_network_gate,
-    });
+    let (membership, observed_group_receiver, observe_history_endpoint) =
+        observability::observe_membership(
+            SpaceMembershipAdapters {
+                membership_records: space_setup.membership_ledger.clone()
+                    as Arc<dyn uc_application::deps::MembershipRecordStorePort>,
+                peer_access: Arc::clone(&space_setup.peer_access),
+                historical_membership_signatures: historical_signatures.clone(),
+                current_member_signatures: Arc::clone(&space_setup.current_member_signatures),
+                membership_identity: membership_identity.clone(),
+                membership_announcement: membership_identity,
+                device_trust_observations: Arc::new(DeviceTrustObservationsAdapter::new(
+                    Arc::clone(&space_setup.member_repo),
+                    Arc::clone(&peer_reachability),
+                )),
+                membership_history_transport: membership_history_synchronization_transport,
+                verified_peer_address_refresh: verified_peer_address_refresh.clone(),
+                membership_branch_recovery_channel,
+                membership_branch_recovery_recipient: Arc::clone(
+                    &space_setup
+                        .space_access
+                        .prepare_membership_branch_recovery_recipient,
+                ),
+                membership_branch_transition: Arc::new(
+                    DefaultMembershipBranchTransitionPreparation::new(Arc::clone(
+                        &space_setup.active_generation_manifest_store,
+                    )),
+                ),
+                membership_branch_transition_executor: Arc::clone(
+                    &space_setup.membership_branch_transition_executor,
+                ),
+                membership_branch_recovery_material: Arc::clone(
+                    &space_setup
+                        .space_access
+                        .prepare_membership_branch_recovery_material,
+                ),
+                apply_membership_member_facts: Arc::new(MembershipMemberFactsAdapter::new(
+                    Arc::clone(&space_setup.member_repo),
+                    Arc::clone(&space_setup.trusted_peer_repo),
+                    Arc::clone(&space_setup.peer_addr_repo),
+                    Arc::clone(&space_setup.device_identity),
+                    Arc::clone(&space_setup.clock),
+                )),
+                apply_membership_security: membership_security,
+                activate_membership_effect: Arc::new(MembershipActivationAdapter::new(Arc::clone(
+                    &peer_reachability,
+                ))),
+                restricted_membership_delivery: membership_history_transport,
+                group_update_store: Arc::clone(&space_setup.space_access.group_revocation),
+                group_update_apply,
+                group_update_receiver,
+                group_update_wire,
+                group_update_local_work,
+                group_update_dispatch: {
+                    #[cfg(feature = "dev-tools")]
+                    let dispatch = Arc::new(RecordedGroupUpdateDispatch::new(
+                        group_update_dispatch,
+                        joiner_final_confirmation_gate.space_work_control(),
+                    ));
+                    #[cfg(not(feature = "dev-tools"))]
+                    let dispatch = group_update_dispatch;
+                    dispatch
+                },
+                membership_network_activity: membership_network_gate,
+            },
+            complete_group_receiver,
+        );
+    builder.install_group_updates(group_manager, observed_group_receiver, legacy_group_updates)?;
     let admission = build_admission();
     let space_runtime = SpaceRuntimeAdapters {
         admission,
@@ -444,6 +573,9 @@ pub async fn prepare_sync_session(
     #[cfg(not(feature = "lan-compat"))]
     let mobile_device_repo: Arc<dyn uc_core::ports::FindMobileDeviceByIdPort> =
         Arc::new(UnavailableMobileDeviceLookup);
+    let directory_publisher = FsAtomicPublisher::new();
+    #[cfg(all(test, feature = "dev-tools", target_os = "linux"))]
+    let directory_publisher = directory_probe::decorate(directory_publisher);
     let clipboard =
         crate::assembly::observability::observe_clipboard(ApplicationClipboardAdapters {
             peer_addresses: Arc::clone(&space_setup.peer_addr_repo),
@@ -454,7 +586,7 @@ pub async fn prepare_sync_session(
             mobile_device_repo,
             active_receiver: active_clipboard_receiver,
             active_dispatch: active_clipboard_dispatch,
-            active_pull_publisher: FsAtomicPublisher::new(),
+            active_pull_publisher: directory_publisher,
             active_pull_target_reserver: FsInboundFileTarget::new(Arc::clone(
                 &space_setup.settings,
             )),
@@ -462,6 +594,14 @@ pub async fn prepare_sync_session(
             staging_cleanup: FsDirectoryStagingCleaner::new(),
         });
     let application_network = application.assemble_network(ApplicationNetworkAdapters {
+        blob_downloads: Arc::new(BlobDownloadResources {
+            transport: blob_transport,
+            store: blob_read_store,
+            source: Arc::new(IrohBlobSourceResolver::new(
+                space_setup.peer_access.clone(),
+                space_setup.fingerprint.clone(),
+            )),
+        }),
         blob_transfer: Arc::clone(&blob_transfer),
         blob_reference: Arc::clone(&space_setup.blob_reference_repo),
         outbound_progress_reporter: Arc::clone(&outbound_progress_reporter),
@@ -498,37 +638,58 @@ pub async fn prepare_sync_session(
             application_network.space_admission_endpoint(),
         ),
         space_setup.admission_credentials.clone()
-            as Arc<dyn uc_infra::network::iroh::SpaceAdmissionChannelCredentialPort>,
+            as Arc<dyn uc_infra_p2p::network::iroh::SpaceAdmissionChannelCredentialPort>,
     )?;
-    builder.install_membership_history_exchange(
-        &membership_history_exchange_adapter,
-        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerIdentityDirectoryPort>,
-        Arc::clone(&space_setup.fingerprint),
-        application_network.membership_history_endpoint(),
-    )?;
+    let history_endpoint = application_network.membership_history_endpoint();
+    #[cfg(feature = "dev-tools")]
+    let history_endpoint = Arc::new(GatedMembershipHistoryEndpoint::new(
+        history_endpoint,
+        joiner_final_confirmation_gate.space_work_control(),
+    ));
+    let history_receiver = Arc::new(MembershipHistoryReceiver::new(
+        history_manager.clone(),
+        history_wire,
+        history_binding,
+        Arc::new(SessionMembershipHistoryLocalWork),
+        observe_history_endpoint(history_endpoint),
+    ));
+    builder.install_membership_history_exchange(history_manager, history_receiver)?;
     builder.install_membership_branch_recovery(
         Arc::clone(&space_setup.peer_access) as Arc<dyn PeerIdentityDirectoryPort>,
         Arc::clone(&space_setup.fingerprint),
         application_network.membership_branch_recovery_endpoint(),
     )?;
-    let content_gate: Arc<dyn ContentExchangeGatePort> = Arc::new(CurrentMemberContentGate::new(
-        application_network.current_member_scope(),
-    ));
 
     // Install the active-clipboard pull ALPN (0xC2, issue #1017 PR8) as a
     // further independent sibling, before `spawn()`. The serve port reuses the
     // resend crypto chain (reconstruct → publish blobs re-signing self-pinned
     // tickets, D3 → encode V3 → encrypt, D4); the returned client port drives
     // the inbound seam's on-demand pull.
+    let pull_connectivity = builder.connectivity_deps(
+        ConnectivityProfile::ActiveClipboardPull,
+        space_setup.peer_addr_repo.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.peer_access.clone(),
+        space_setup.fingerprint.clone(),
+        peer_reachability.clone(),
+    );
+    let pull_manager = ConnectivityManager::new(
+        pull_connectivity.backend,
+        pull_connectivity.admission,
+        ConnectivityPolicy {
+            inbound_per_connection: 1,
+            ..ConnectivityPolicy::default()
+        },
+    );
+    let preparation = application_network.active_clipboard_pull_preparation();
+    #[cfg(all(test, feature = "dev-tools"))]
+    let preparation = decorate_preparation(&space_setup.iroh_blob_store_dir, preparation);
     let ActiveClipboardPullHandlers {
         client: active_clipboard_pull_client,
     } = builder.install_active_clipboard_pull(
-        Arc::clone(&space_setup.peer_addr_repo),
-        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerIdentityDirectoryPort>,
-        Arc::clone(&space_setup.peer_access) as Arc<dyn PeerAdmissionPort>,
-        Arc::clone(&space_setup.fingerprint),
-        application_network.active_clipboard_pull_serve(),
-        content_gate,
+        pull_manager,
+        preparation,
+        application_network.current_member_scope(),
     )?;
 
     let prepared_session = builder.finish();

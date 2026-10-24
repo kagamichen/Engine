@@ -1,5 +1,13 @@
+pub(crate) use history_transport::within_history_budget;
+mod history_transport;
+pub use history_transport::{
+    membership_history_purpose, HistoryConnectionRetentionPort, HistoryIncoming,
+    HistoryLocalWorkPort, HistoryPeerBindingPort, HistoryReceiverPort, HistoryReply,
+    HistoryWirePort, HistoryWork, MembershipHistoryReceiver, MembershipHistoryTransport,
+};
 mod access;
 mod decide_device_trust_change;
+mod group_update;
 mod group_update_delivery;
 mod handle_history_message;
 mod initializer;
@@ -30,6 +38,12 @@ pub use decide_device_trust_change::{
     DecideDeviceTrustChange, DecideDeviceTrustChangeError, DecideDeviceTrustChangeResult,
     DeviceTrustChangeChoice,
 };
+pub use group_update::{
+    ApplyGroupUpdatePort, GroupUpdateApplyError, GroupUpdateEndpoint, GroupUpdateIncoming,
+    GroupUpdateLocalWorkPort, GroupUpdateReceiveOutcome, GroupUpdateReceiverPort,
+    GroupUpdateWirePort, GroupUpdateWork, PreparedGroupUpdate, VerifiedHistoryGroupUpdate,
+};
+pub(crate) use group_update::{GroupUpdateApplyCoordinator, RecoverGroupUpdatesPort};
 #[cfg(test)]
 pub(crate) use maintenance::MembershipMaintenanceExclusion;
 pub use maintenance::{
@@ -51,12 +65,13 @@ pub use projection::MembershipProjectionPlan;
 pub(crate) use query_device_group_choices::QueryDeviceGroupChoicesUseCase;
 pub use query_device_group_choices::{DeviceGroupChoicesView, QueryDeviceGroupChoicesError};
 pub use query_device_trust::{
-    AdmissionDisplayStatus, DeviceTrustDevice, DeviceTrustImpact, DeviceTrustMembership,
-    DeviceTrustObservation, DeviceTrustRelationship, DeviceTrustStatus, DeviceTrustSyncState,
-    LoadCurrentJoinStatusPort, LoadDeviceTrustObservationsPort, PairingConfirmationObservation,
-    PairingConfirmationStatus, PairingConfirmationTarget, PendingDeviceTrustChange,
-    QueryDeviceTrustError, SpaceDeviceUpdatePhase, SpaceDeviceUpdateProblem,
-    SpaceDeviceUpdateRecovery, SpaceDeviceUpdateStatus,
+    AdmissionDisplayStatus, DeviceGroupUpdate, DeviceGroupUpdateRecovery, DeviceGroupUpdateState,
+    DeviceTrustDevice, DeviceTrustImpact, DeviceTrustMembership, DeviceTrustObservation,
+    DeviceTrustRelationship, DeviceTrustStatus, DeviceTrustSyncState, LoadCurrentJoinStatusPort,
+    LoadDeviceTrustObservationsPort, PairingConfirmationObservation, PairingConfirmationStatus,
+    PairingConfirmationTarget, PendingDeviceTrustChange, QueryDeviceTrustError,
+    SpaceDeviceUpdatePhase, SpaceDeviceUpdateProblem, SpaceDeviceUpdateRecovery,
+    SpaceDeviceUpdateStatus,
 };
 pub(super) use query_diagnostics::QueryMembershipDiagnosticsUseCase;
 pub use query_diagnostics::{MembershipDiagnosticsView, QueryMembershipDiagnosticsError};
@@ -67,10 +82,11 @@ pub use query_readiness::{MembershipReadiness, QueryMembershipReadinessError};
 pub use re_pairing::{RePairingStateError, RePairingStateStorePort};
 pub(crate) use reconcile_history_evidence::ReconcileMembershipEvidenceUseCase;
 pub use record::{
-    InboundMembershipTransfer, MembershipBranchRecoveryRecord, MembershipBranchRecoverySession,
-    MembershipBranchRecoverySessionState, MembershipConflictMember, MembershipConflictPresentation,
-    MembershipConflictRecord, MembershipConflictStatus, MembershipHistoryExchangeRecord,
-    MembershipRecord, SpaceMembershipRecord,
+    GroupUpdateRecoveryRecord, InboundMembershipTransfer, MembershipBranchRecoveryRecord,
+    MembershipBranchRecoverySession, MembershipBranchRecoverySessionState,
+    MembershipConflictMember, MembershipConflictPresentation, MembershipConflictRecord,
+    MembershipConflictStatus, MembershipHistoryExchangeRecord, MembershipRecord,
+    SpaceMembershipRecord,
 };
 pub use recover_conflict::{
     AdvanceMembershipBranchTransitionError, AdvanceMembershipBranchTransitionInput,
@@ -122,8 +138,8 @@ pub(crate) use owner::{ledger_error, pause_reason, MembershipOwner, MembershipVi
 #[cfg(test)]
 pub(super) use query_admission::{MembershipAdmissionSnapshot, QueryMembershipAdmissionError};
 pub(super) use query_admission::{QueryMembershipAdmissionPort, QueryMembershipAdmissionUseCase};
-pub(crate) use query_device_trust::LoadSecurityDeviceUpdateStatusPort;
 pub(super) use query_device_trust::QueryDeviceTrustUseCase;
+pub(crate) use query_device_trust::{LoadSecurityDeviceUpdateStatusPort, SecurityDeviceUpdates};
 pub(super) use re_pairing::{RePairingState, ResolveRePairingPort};
 pub(super) use recover_conflict::IssueMembershipBranchRecoveryUseCase;
 pub(super) use recover_conflict::RecoverMembershipConflictUseCase;
@@ -131,5 +147,7 @@ pub(super) use remove_space_member::RemoveSpaceMemberUseCase;
 pub(crate) use resolve_conflict::QueryMembershipConflictStatusPort;
 pub(super) use resolve_conflict::ResolveMembershipConflictUseCase;
 pub(crate) use worker::{
-    MembershipWorker, MembershipWorkerDeps, RePairingAwareMembershipActivation,
+    HistorySynchronizer, MembershipWorker, MembershipWorkerDeps, RePairingAwareMembershipActivation,
 };
+
+pub(crate) use group_update::PrepareMembershipRemovalPort;

@@ -5,18 +5,19 @@ use uc_application::facade::{
     AdmissionReadFailureCategory, AdmissionRecoveryAction as ReadRecoveryAction,
     AdmissionRecoveryStage as ReadRecoveryStage,
 };
+use uc_observability_contract::wire_enum;
 
 use super::{EngineError, ResendEntryOutcome, SendReportSummary};
 use crate::{
     ConfigExportOutcome, ConfigImportPreviewOutcome, ConfigImportStageOutcome,
-    CustomRelayMutationOutcome, CustomRelaySummary, DebugModeUpdateSummary,
-    DiagnosticLogsExportSummary, DiagnosticsStatusSummary, MobileAuthenticatedSession,
-    MobileAuthenticationOutcome, MobileDeviceRegistrationOutcome, MobileDeviceRevokeOutcome,
-    MobileDeviceSummary, MobileDeviceUpdateOutcome, MobileFileUploadHandle,
-    MobileLanInterfaceSummary, MobileSyncDocument, MobileSyncDocumentApplyOutcome,
-    MobileSyncFileReadOutcome, MobileSyncSettingsSummary, MobileSyncSettingsUpdateOutcome,
-    RelayCredentialStatus, RelayOverview, RelayProbeOutcome, SaveRelayOutcome, SettingsSummary,
-    SettingsUpdateOutcome, UpgradeStatusSummary,
+    CustomRelayMutationOutcome, CustomRelaySummary, DiagnosticLogsExportSummary,
+    DiagnosticsStatusSummary, MobileAuthenticatedSession, MobileAuthenticationOutcome,
+    MobileDeviceRegistrationOutcome, MobileDeviceRevokeOutcome, MobileDeviceSummary,
+    MobileDeviceUpdateOutcome, MobileFileUploadHandle, MobileLanInterfaceSummary,
+    MobileSyncDocument, MobileSyncDocumentApplyOutcome, MobileSyncFileReadOutcome,
+    MobileSyncSettingsSummary, MobileSyncSettingsUpdateOutcome, RelayCredentialStatus,
+    RelayOverview, RelayProbeOutcome, SaveRelayOutcome, SettingsSummary, SettingsUpdateOutcome,
+    UpgradeStatusSummary,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +272,48 @@ pub enum DeliveryFailureReasonSummary {
     Internal,
 }
 
+wire_enum! {
+    serde
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ReceiveItemKind {
+        Unknown => "unknown",
+        File => "file",
+        Representation => "representation",
+        DirectoryUnit => "directory_unit",
+    }
+}
+wire_enum! {
+    serde
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ReceiveItemFailureReason {
+        NetworkUnavailable => "network_unavailable",
+        TimedOut => "timed_out",
+        AccessDenied => "access_denied",
+        StorageUnavailable => "storage_unavailable",
+        IntegrityCheckFailed => "integrity_check_failed",
+        Interrupted => "interrupted",
+        Unknown => "unknown",
+    }
+}
+impl fmt::Display for ReceiveItemKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.wire())
+    }
+}
+impl fmt::Display for ReceiveItemFailureReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.wire())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiveItemSummary {
+    pub item_id: String,
+    pub kind: ReceiveItemKind,
+    pub state: String,
+    /// 目录尚待结算时也可携带已知失败原因；父接收是否结束仍以聚合状态为准。
+    pub failure_reason: Option<ReceiveItemFailureReason>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiveProgressSummary {
     pub entry_id: String,
@@ -280,6 +323,8 @@ pub struct ReceiveProgressSummary {
     pub completed_bytes: i64,
     pub items_total: u32,
     pub items_completed: u32,
+    #[serde(default)]
+    pub items: Vec<ReceiveItemSummary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,21 +333,66 @@ pub struct ReceiveReadinessSummary {
     pub degraded: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EntryReceiveCancellationOutcome {
-    Cancelled,
-    NotReceiving,
-    TooLate,
-    AlreadyTerminal,
-    Superseded,
+wire_enum! {
+    serde
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum ReceiveRetryUnavailableReason {
+        SourceUnavailable => "source_unavailable",
+        AccessDenied => "access_denied",
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InboundTransferCancellationOutcome {
-    Cancelled,
-    NotInflight,
+impl fmt::Display for ReceiveRetryUnavailableReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.wire())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum EntryReceiveRetryOutcome {
+    Accepted {
+        attempt_id: String,
+    },
+    AlreadyReceiving,
+    Superseded,
+    CancellationIncomplete,
+    Unavailable {
+        reason: ReceiveRetryUnavailableReason,
+    },
+}
+
+wire_enum! {
+    serde
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum EntryReceiveCancellationOutcome {
+        Cancelled => "cancelled",
+        CancellationIncomplete => "cancellation_incomplete",
+        NotReceiving => "not_receiving",
+        TooLate => "too_late",
+        AlreadyTerminal => "already_terminal",
+        Superseded => "superseded",
+    }
+}
+wire_enum! {
+    serde
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum InboundTransferCancellationOutcome {
+        Cancelled => "cancelled",
+        CancellationIncomplete => "cancellation_incomplete",
+        NotInflight => "not_inflight",
+    }
+}
+
+impl fmt::Display for EntryReceiveCancellationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.wire())
+    }
+}
+impl fmt::Display for InboundTransferCancellationOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.wire())
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +484,8 @@ pub struct JoinedSpaceSummary {
 pub enum JoinSpaceRejectionReasonSummary {
     InvitationUnavailable,
     AuthenticationRejected,
+    /// Sponsor 收下初次请求后在截止内没有任何应答；不是认证失败，也不是口令错误。
+    SponsorUnresponsive,
     IdentityConflict,
     BaseHistoryChanged,
     JoinerHistoryAhead,
@@ -412,12 +504,16 @@ pub enum JoinSpaceRejectionReasonSummary {
 #[serde(rename_all = "snake_case")]
 pub enum JoinSpaceAttentionReasonSummary {
     OutcomeCannotBeProven,
+    /// 本机已经完成一次完整密码校验，但对端确认续传凭据不可用；不是密码错误。
+    ContinuationUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JoinSpaceAttentionRecoverySummary {
     PreserveDataAndContactSupport,
+    /// 当前邀请码对应的加入会话已经无法续传，只能用一个全新邀请码重新开始。
+    RestartWithNewInvitation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,7 +626,6 @@ pub enum OperationResult {
         version: String,
     },
     DiagnosticsStatus(DiagnosticsStatusSummary),
-    DebugModeUpdated(DebugModeUpdateSummary),
     DiagnosticLogsExported(DiagnosticLogsExportSummary),
     ConfigExport(ConfigExportOutcome),
     ConfigImportPreview(ConfigImportPreviewOutcome),
@@ -593,6 +688,13 @@ pub enum OperationResult {
     HistoryEntry(HistoryEntryDetailSummary),
     HistoryEntryDeleted,
     HistoryEntryFavoriteSet,
+    HistoryTags(Vec<HistoryTagSummary>),
+    HistoryTagCreated(HistoryTagCreatedSummary),
+    HistoryTagRenamed(HistoryTagRenameSummary),
+    HistoryTagEntriesChanged(HistoryTagBatchSummary),
+    HistoryEntryTags(HistoryEntryTagSummary),
+    HistoryTagsMerged(HistoryTagMergeSummary),
+    HistoryTagDeleted(HistoryTagDeletedSummary),
     HistoryStats(HistoryStatsSummary),
     HistoryEntryResource(HistoryEntryResourceSummary),
     BlobRead(BinaryResourceSummary),
@@ -603,6 +705,7 @@ pub enum OperationResult {
     EntryReceiveProgress(Option<ReceiveProgressSummary>),
     EntryReceiveProgressList(Vec<ReceiveProgressSummary>),
     EntryReceiveCancellation(EntryReceiveCancellationOutcome),
+    EntryReceiveRetry(EntryReceiveRetryOutcome),
     InboundTransferCancellation(InboundTransferCancellationOutcome),
     ClipboardCaptured {
         entry_id: Option<String>,
@@ -645,15 +748,17 @@ pub struct DeviceGroupChoiceOptionSummary {
     pub impact: Option<super::DeviceGroupChoiceImpactSummary>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DeviceGroupChoiceOutcomeSummary {
-    Completed,
-    Pending,
-    RePairingRequired,
-    AlreadyCompleted,
-    StateChanged,
-    LocalDeviceConfirmationRequired,
+uc_observability_contract::wire_enum! {
+    serde
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum DeviceGroupChoiceOutcomeSummary {
+        Completed => "completed",
+        Pending => "pending",
+        RePairingRequired => "re_pairing_required",
+        AlreadyCompleted => "already_completed",
+        StateChanged => "state_changed",
+        LocalDeviceConfirmationRequired => "local_device_confirmation_required",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -775,9 +880,6 @@ impl fmt::Debug for OperationResult {
             Self::DiagnosticsStatus(status) => debug
                 .field("kind", &"diagnostics_status")
                 .field("status", status),
-            Self::DebugModeUpdated(result) => debug
-                .field("kind", &"debug_mode_updated")
-                .field("result", result),
             Self::DiagnosticLogsExported(result) => debug
                 .field("kind", &"diagnostic_logs_exported")
                 .field("result", result),
@@ -913,6 +1015,29 @@ impl fmt::Debug for OperationResult {
             Self::HistoryEntry(_) => debug.field("kind", &"history_entry"),
             Self::HistoryEntryDeleted => debug.field("kind", &"history_entry_deleted"),
             Self::HistoryEntryFavoriteSet => debug.field("kind", &"history_entry_favorite_set"),
+            Self::HistoryTags(tags) => debug
+                .field("kind", &"history_tags")
+                .field("tag_count", &tags.len()),
+            Self::HistoryTagCreated(created) => debug
+                .field("kind", &"history_tag_created")
+                .field("created", &created.created),
+            Self::HistoryTagRenamed(renamed) => debug.field("kind", &"history_tag_renamed").field(
+                "conflict",
+                &matches!(renamed, HistoryTagRenameSummary::NameConflict { .. }),
+            ),
+            Self::HistoryTagEntriesChanged(batch) => debug
+                .field("kind", &"history_tag_entries_changed")
+                .field("batch", batch),
+            Self::HistoryEntryTags(summary) => debug
+                .field("kind", &"history_entry_tags")
+                .field("selected", &summary.selected)
+                .field("tag_count", &summary.tags.len()),
+            Self::HistoryTagsMerged(merged) => debug
+                .field("kind", &"history_tags_merged")
+                .field("merged", merged),
+            Self::HistoryTagDeleted(deleted) => debug
+                .field("kind", &"history_tag_deleted")
+                .field("deleted", deleted),
             Self::HistoryStats(stats) => {
                 debug.field("kind", &"history_stats").field("stats", stats)
             }
@@ -942,6 +1067,9 @@ impl fmt::Debug for OperationResult {
             Self::EntryReceiveProgressList(progress) => debug
                 .field("kind", &"entry_receive_progress_list")
                 .field("progress_count", &progress.len()),
+            Self::EntryReceiveRetry(outcome) => debug
+                .field("kind", &"entry_receive_retry")
+                .field("outcome", outcome),
             Self::EntryReceiveCancellation(outcome) => debug
                 .field("kind", &"entry_receive_cancellation")
                 .field("outcome", outcome),
@@ -1344,8 +1472,47 @@ pub struct DeviceTrustRelationshipSummary {
     pub sync_relationship: DeviceSyncRelationshipSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_confirmation: Option<PairingConfirmationSummary>,
+    /// 本机对该设备尚未确认的组密钥更新；缺省表示没有未确认的更新。它与成员保护状态相互独立。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_update: Option<DeviceGroupUpdateSummary>,
     pub available_actions: Vec<DeviceTrustActionSummary>,
     pub blocked_reason: Option<DeviceTrustUnavailableReasonSummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceGroupUpdateStateSummary {
+    /// 尚未送达（未尝试或设备不可达）。
+    Waiting,
+    /// 设备在线但暂时无法应用。
+    ReceiverUnavailable,
+    /// 设备拒绝且原因未知（旧版设备或升级前遗留）。
+    RejectedUnclassified,
+    /// 设备明确拒绝。
+    RejectedByReceiver,
+}
+
+/// Engine 自己会不会推进该更新。`automatic*` 时宿主的“重新检查”不会改变结果，不应提供。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceGroupUpdateRecoverySummary {
+    /// 按退避自动重试。
+    Automatic,
+    /// 设备重新通过认证后自动重新评估一次（有频率上限）。
+    AutomaticOnReconnect,
+    /// 不会自动重发，需要核对该设备（例如更新其应用或重新配对）。
+    ReviewDevice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceGroupUpdateSummary {
+    pub epoch: u64,
+    pub state: DeviceGroupUpdateStateSummary,
+    pub recovery: DeviceGroupUpdateRecoverySummary,
+    pub attempts: u32,
+    /// 仅在 `recovery` 为 `automatic` 时给出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1658,6 +1825,82 @@ impl fmt::Debug for SearchResultSummary {
             .field("has_payload_state", &self.payload_state.is_some())
             .finish()
     }
+}
+
+/// 一个本机历史标签。`name` 为 `None` 表示名称无法解密，该标签只能删除。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTagSummary {
+    pub tag_id: String,
+    pub name: Option<String>,
+    pub created_at_ms: i64,
+    pub entry_count: u32,
+}
+
+impl fmt::Debug for HistoryTagSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HistoryTagSummary")
+            .field("has_name", &self.name.is_some())
+            .field("entry_count", &self.entry_count)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTagCreatedSummary {
+    pub tag: HistoryTagSummary,
+    /// `false` 表示同名标签已存在，`tag` 是已有标签。
+    pub created: bool,
+}
+
+/// 改名结果：新名称与另一个标签同名时不写入，返回冲突标签 id。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoryTagRenameSummary {
+    Renamed(HistoryTagSummary),
+    NameConflict { existing_tag_id: String },
+}
+
+/// 批量关联或移除结果：存在的条目在一个事务内生效，不存在的条目被跳过。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTagBatchSummary {
+    pub changed: u32,
+    pub unchanged: u32,
+    pub missing_entry_ids: Vec<String>,
+}
+
+impl fmt::Debug for HistoryTagBatchSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HistoryTagBatchSummary")
+            .field("changed", &self.changed)
+            .field("unchanged", &self.unchanged)
+            .field("missing_count", &self.missing_entry_ids.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTagApplicationSummary {
+    pub tag_id: String,
+    pub applied: u32,
+}
+
+/// 一组条目的标签汇总；`applied == selected` 表示全部携带。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryEntryTagSummary {
+    pub selected: u32,
+    pub tags: Vec<HistoryTagApplicationSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTagMergeSummary {
+    pub moved: u32,
+    pub already_on_target: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTagDeletedSummary {
+    pub detached: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

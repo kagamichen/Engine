@@ -3,6 +3,8 @@
 //! 同一份源码也被覆盖到升级兼容矩阵的各个旧版 Engine rev 上构建；旧版公开接口的差异由按能力
 //! 划分的 feature 表达，锚点与 feature 的对应关系见 `tests/upgrade-matrix/host-features.json`。
 
+#[cfg(feature = "current-engine")]
+mod concurrent_send;
 mod content;
 #[cfg(feature = "current-engine")]
 mod network_faults;
@@ -24,10 +26,11 @@ use uc_engine::observability::{
 #[cfg(feature = "connectivity-opportunity")]
 use uc_engine::ConnectivityOpportunity;
 use uc_engine::{
-    CreateSpaceInput, Engine, EngineConfig, EngineEvent, HistoryEntryInput, HostCapabilities,
-    HostCapabilityError, HostCapabilityErrorCategory, HostDirectories, HostFileAccess,
-    HostFileHandle, HostFileMetadata, HostSecureStorage, JoinSpaceInput, ListHistoryEntriesInput,
-    Operation, OperationResult, RemoveMemberInput, SecretString, SendFilesInput, SendTextInput,
+    ClipboardRestoreMode, ClipboardRestoreOutcome, CreateSpaceInput, Engine, EngineConfig,
+    EngineEvent, HistoryEntryInput, HostCapabilities, HostCapabilityError,
+    HostCapabilityErrorCategory, HostDirectories, HostFileAccess, HostFileHandle, HostFileMetadata,
+    HostSecureStorage, JoinSpaceInput, ListHistoryEntriesInput, Operation, OperationResult,
+    RemoveMemberInput, RestoreClipboardInput, SecretString, SendFilesInput, SendTextInput,
     SettingsPatch, SyncSettingsPatch, UnlockSpaceInput,
 };
 
@@ -146,6 +149,23 @@ fn space_work_event_kind(value: &str) -> Result<uc_engine::DevSpaceWorkEventKind
         "ordinary_member_update_started" => {
             Ok(uc_engine::DevSpaceWorkEventKind::OrdinaryMemberUpdateStarted)
         }
+        "group_update_missing_predecessor_observed" => {
+            Ok(uc_engine::DevSpaceWorkEventKind::GroupUpdateMissingPredecessorObserved)
+        }
+        "group_update_tampered" => Ok(uc_engine::DevSpaceWorkEventKind::GroupUpdateTampered),
+        "group_update_applied" => Ok(uc_engine::DevSpaceWorkEventKind::GroupUpdateApplied),
+        "group_update_current_wire_sent" => {
+            Ok(uc_engine::DevSpaceWorkEventKind::GroupUpdateCurrentWireSent)
+        }
+        "group_update_current_wire_acknowledged" => {
+            Ok(uc_engine::DevSpaceWorkEventKind::GroupUpdateCurrentWireAcknowledged)
+        }
+        "group_update_legacy_wire_sent" => {
+            Ok(uc_engine::DevSpaceWorkEventKind::GroupUpdateLegacyWireSent)
+        }
+        "group_update_legacy_wire_acknowledged" => {
+            Ok(uc_engine::DevSpaceWorkEventKind::GroupUpdateLegacyWireAcknowledged)
+        }
         "membership_history_sync_started" => {
             Ok(uc_engine::DevSpaceWorkEventKind::MembershipHistorySyncStarted)
         }
@@ -195,6 +215,29 @@ fn space_work_event_json(event: uc_engine::DevSpaceWorkEvent) -> Value {
         uc_engine::DevSpaceWorkEventKind::MembershipHistorySyncReplyReceived => {
             "membership_history_sync_reply_received"
         }
+        uc_engine::DevSpaceWorkEventKind::GroupUpdateReceiveFaultInjected => {
+            "group_update_receive_fault_injected"
+        }
+        uc_engine::DevSpaceWorkEventKind::GroupUpdateMissingPredecessorObserved => {
+            "group_update_missing_predecessor_observed"
+        }
+        uc_engine::DevSpaceWorkEventKind::GroupUpdateApplied => "group_update_applied",
+        uc_engine::DevSpaceWorkEventKind::GroupUpdateTampered => "group_update_tampered",
+        uc_engine::DevSpaceWorkEventKind::LegacyReceiverRejectionInjected => {
+            "legacy_receiver_rejection_injected"
+        }
+        uc_engine::DevSpaceWorkEventKind::GroupUpdateCurrentWireSent => {
+            "group_update_current_wire_sent"
+        }
+        uc_engine::DevSpaceWorkEventKind::GroupUpdateLegacyWireSent => {
+            "group_update_legacy_wire_sent"
+        }
+        uc_engine::DevSpaceWorkEventKind::GroupUpdateCurrentWireAcknowledged => {
+            "group_update_current_wire_acknowledged"
+        }
+        uc_engine::DevSpaceWorkEventKind::GroupUpdateLegacyWireAcknowledged => {
+            "group_update_legacy_wire_acknowledged"
+        }
     };
     json!({ "sequence": event.sequence, "kind": kind })
 }
@@ -221,13 +264,43 @@ async fn operation(
 ) -> Result<Value> {
     let command = string(request, "command")?;
     match command {
+        #[cfg(feature = "connectivity-opportunity")]
+        "network_endpoint" => {
+            let uc_engine::DevOperationResult::NetworkEndpointId(endpoint) = engine
+                .execute_dev(uc_engine::DevOperation::QueryNetworkEndpointId)
+                .await?
+            else {
+                bail!("network endpoint expected");
+            };
+            return Ok(json!(endpoint));
+        }
         #[cfg(feature = "current-engine")]
-        "network_endpoint" | "reject_reachability_dials" | "rejected_dials" => {
+        "send_concurrent" => return concurrent_send::send(engine, request).await,
+        #[cfg(feature = "current-engine")]
+        "reject_reachability_dials" | "rejected_dials" | "set_network_partition" => {
+            return network_faults::execute(engine, command, request).await;
+        }
+        #[cfg(feature = "inbound-network-faults")]
+        "reject_inbound_presence" => {
             return network_faults::execute(engine, command, request).await;
         }
         "capture" => return content::capture(engine, clipboard, files, request).await,
         "observe" => return observe::observe(engine).await,
+        "clipboard" => return clipboard.observed(),
         _ => {}
+    }
+    #[cfg(feature = "current-engine")]
+    if command == "network_addresses" {
+        let uc_engine::DevOperationResult::PairingInvitationAddresses(addresses) = engine
+            .execute_dev(uc_engine::DevOperation::ListPairingInvitationAddresses)
+            .await?
+        else {
+            bail!("network addresses result expected")
+        };
+        return Ok(json!(addresses
+            .iter()
+            .map(|address| (address.ip.to_string(), address.port))
+            .collect::<Vec<_>>()));
     }
     #[cfg(feature = "current-engine")]
     if command == "connections" {
@@ -315,6 +388,30 @@ async fn operation(
         return Ok(json!({ "remaining": remaining }));
     }
     #[cfg(feature = "current-engine")]
+    if command == "set_membership_history_held" {
+        let held = request["held"]
+            .as_bool()
+            .context("missing history hold state")?;
+        engine
+            .execute_dev(uc_engine::DevOperation::SetMembershipHistoryHeld {
+                held,
+                peer: request["peer"].as_str().map(str::to_owned),
+            })
+            .await?;
+        return Ok(json!(true));
+    }
+    #[cfg(feature = "current-engine")]
+    if command == "arm_group_update_tamper" {
+        let count = request["count"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .context("invalid tamper count")?;
+        engine
+            .execute_dev(uc_engine::DevOperation::ArmGroupUpdateTamper { count })
+            .await?;
+        return Ok(json!(true));
+    }
+    #[cfg(feature = "current-engine")]
     if command == "wait_space_work_event" {
         let after_sequence = request["after_sequence"]
             .as_u64()
@@ -381,6 +478,7 @@ async fn operation(
         }),
         "sync_preference" => Operation::UpdateSettings(Box::new(SettingsPatch {
             sync: Some(SyncSettingsPatch {
+                auto_sync_enabled: request["auto_sync_enabled"].as_bool(),
                 sync_on_restore: Some(
                     request["sync_on_restore"]
                         .as_bool()
@@ -390,10 +488,21 @@ async fn operation(
             }),
             ..Default::default()
         })),
+        "active" => Operation::QueryActiveClipboard,
+        "delete" => Operation::DeleteHistoryEntry(HistoryEntryInput {
+            entry_id: string(request, "entry")?.into(),
+        }),
+        "lock" => Operation::LockEncryption,
+        "restore" => Operation::RestoreClipboard(RestoreClipboardInput {
+            entry_id: string(request, "entry")?.into(),
+            mode: ClipboardRestoreMode::Standard,
+        }),
         "setup" => Operation::QuerySetupState,
         "peers" => Operation::QueryPeerConnections,
         #[cfg(feature = "device-group-choices")]
         "eligibility" => Operation::QueryDeviceGroupChoices,
+        #[cfg(feature = "current-engine")]
+        "membership_diagnostics" => Operation::QueryMembershipDiagnostics,
         #[cfg(feature = "connectivity-opportunity")]
         "opportunity" => Operation::NotifyConnectivityOpportunity {
             reason: ConnectivityOpportunity::NetworkChanged,
@@ -460,8 +569,14 @@ async fn operation(
         OperationResult::PeerConnections(peers) => serde_json::to_value(peers)?,
         #[cfg(feature = "device-group-choices")]
         OperationResult::DeviceGroupChoices(choices) => serde_json::to_value(choices)?,
+        #[cfg(feature = "current-engine")]
+        OperationResult::MembershipDiagnostics(summary) => serde_json::to_value(summary)?,
         OperationResult::EntrySent(report) => serde_json::to_value(report)?,
         OperationResult::SettingsUpdated(outcome) => serde_json::to_value(outcome)?,
+        OperationResult::ActiveClipboard(active) => serde_json::to_value(active)?,
+        OperationResult::ClipboardRestored(outcome) => json!({
+            "restored": matches!(outcome, ClipboardRestoreOutcome::Restored),
+        }),
         OperationResult::HistoryEntries(entries) => serde_json::to_value(entries)?,
         OperationResult::HistoryEntry(entry) => serde_json::to_value(entry)?,
         OperationResult::EntryFileRead(resource) => serde_json::to_value(resource)?,
@@ -471,7 +586,15 @@ async fn operation(
 
 /// 宿主身份：构建所用锚点、Engine rev 与按 feature 编译进来的能力。当前源码构建时锚点为 `head`。
 fn host_identity() -> Value {
-    let mut capabilities = vec!["capture", "observe", "unlock", "sync_preference"];
+    let mut capabilities = vec![
+        "capture",
+        "observe",
+        "unlock",
+        "sync_preference",
+        "restore",
+        "active",
+        "clipboard",
+    ];
     for (enabled, name) in [
         (cfg!(feature = "test-network-config"), "local-network"),
         (cfg!(feature = "network-recovery"), "network-recovery"),
@@ -486,6 +609,10 @@ fn host_identity() -> Value {
         ),
         (cfg!(feature = "startup-progress"), "startup-progress"),
         (cfg!(feature = "current-engine"), "space-work-events"),
+        (
+            cfg!(feature = "inbound-network-faults"),
+            "inbound-presence-rejection",
+        ),
     ] {
         if enabled {
             capabilities.push(name);
@@ -507,6 +634,7 @@ fn startup_summary(progress: &uc_engine::StartupProgress) -> Result<Value> {
         "upgrade_required": snapshot["upgrade"]["required"],
         "upgrade_completed": snapshot["upgrade"]["completed"],
         "failure": snapshot["failure"]["reason"],
+        "failure_retryable": snapshot["failure"]["retryable"],
     }))
 }
 
@@ -549,7 +677,7 @@ async fn main() -> Result<()> {
             .map_err(|_| anyhow!("storage unavailable"))? = serde_json::from_value(value.clone())?;
     }
     let files = Files::default();
-    let clipboard = Clipboard::default();
+    let clipboard = Clipboard::new(root.clone());
     let host = HostCapabilities::new(
         HostDirectories::new(
             root.join("private"),
@@ -567,6 +695,9 @@ async fn main() -> Result<()> {
         EngineConfig::new(app_version).with_rendezvous_base_url(string(&start, "rendezvous")?);
     #[cfg(feature = "test-network-config")]
     let config = config.with_test_relay_fallback(start["relay"].as_bool().unwrap_or(false));
+    #[cfg(feature = "current-engine")]
+    let config = config
+        .with_test_legacy_group_updates(start["legacy_group_updates"].as_bool().unwrap_or(false));
     #[cfg(feature = "test-network-config")]
     let config = match start["bind_port"].as_u64() {
         Some(port) => config.with_test_iroh_bind_port(
@@ -612,6 +743,9 @@ async fn main() -> Result<()> {
         async move {
             while let Some(event) = events.next().await {
                 let value = match event {
+                    EngineEvent::ActiveClipboardChanged(change) => {
+                        json!({ "kind": "active", "activated_at_ms": change.activated_at_ms })
+                    }
                     EngineEvent::PeerPresenceChanged(change) => {
                         json!({ "kind": "peer", "peer": change.device_id, "state": change.state })
                     }
@@ -639,6 +773,25 @@ async fn main() -> Result<()> {
             }
         }
     });
+    // 解锁前配置现有 dev-tools 拨号限制；不修改成员资格或旧库行为。
+    #[cfg(feature = "current-engine")]
+    if let Some(endpoint_ids) = start.get("reject_presence_endpoint_ids") {
+        network_faults::execute(
+            &engine,
+            "reject_reachability_dials",
+            &json!({ "endpoint_ids": endpoint_ids }),
+        )
+        .await?;
+    }
+    #[cfg(feature = "inbound-network-faults")]
+    if let Some(endpoint_ids) = start.get("reject_inbound_presence_endpoint_ids") {
+        network_faults::execute(
+            &engine,
+            "reject_inbound_presence",
+            &json!({ "endpoint_ids": endpoint_ids }),
+        )
+        .await?;
+    }
     respond(json!({
         "ready": true,
         "version": env!("CARGO_PKG_VERSION"),
@@ -655,6 +808,13 @@ async fn main() -> Result<()> {
                 observability.force_flush(Duration::from_secs(2));
                 Ok(json!(true))
             }
+            #[cfg(feature = "current-engine")]
+            "start_network_capture" => observability
+                .start_local_diagnostic_capture(uc_engine::observability::DetailedCaptureRequest {
+                    duration: Duration::from_secs(300),
+                })
+                .map(|status| json!(status))
+                .map_err(anyhow::Error::new),
             "events" => recorded
                 .lock()
                 .map(|mut events| json!(std::mem::take(&mut *events)))

@@ -1,0 +1,284 @@
+//! 成员更新的失败动作上下文；固定动作名称不包含输入数据。
+use uc_core::membership::KeyEpochError;
+
+#[derive(Clone, Copy)]
+pub(super) enum GroupUpdateAction {
+    DecodeUpdate,
+    LoadState,
+    ApplySecurityUpdate,
+    ValidateUpdate,
+    PersistState,
+    InstallSecurityState,
+}
+
+impl std::fmt::Display for GroupUpdateAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::DecodeUpdate => "decode_update",
+            Self::LoadState => "load_state",
+            Self::ApplySecurityUpdate => "apply_security_update",
+            Self::ValidateUpdate => "validate_update",
+            Self::PersistState => "persist_state",
+            Self::InstallSecurityState => "install_security_state",
+        })
+    }
+}
+
+#[derive(thiserror::Error)]
+#[error("group update {action} failed")]
+pub(super) struct GroupUpdateFailure {
+    pub(super) action: GroupUpdateAction,
+    #[source]
+    source: anyhow::Error,
+}
+
+impl std::fmt::Debug for GroupUpdateFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, formatter)
+    }
+}
+
+pub(super) fn failed_action(
+    action: GroupUpdateAction,
+    source: impl Into<anyhow::Error>,
+) -> KeyEpochError {
+    KeyEpochError::Repository(
+        GroupUpdateFailure {
+            action,
+            source: source.into(),
+        }
+        .into(),
+    )
+}
+
+pub(super) fn tag_action(action: GroupUpdateAction, error: KeyEpochError) -> KeyEpochError {
+    // 保留既有业务分类；无 source 的规则拒绝不人为构造依赖异常。
+    match error {
+        KeyEpochError::Repository(source) => failed_action(action, source),
+        KeyEpochError::SecurityState { source } => KeyEpochError::SecurityState {
+            source: GroupUpdateFailure { action, source }.into(),
+        },
+        other => other,
+    }
+}
+
+/// 接收方应用组密钥更新失败后，对发送方可见的裁决。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupUpdateVerdict {
+    /// 更新未通过密码学、授权、版本或顺序校验；失败属于裁决更新的验证动作。
+    Rejected,
+    /// 失败只与本机暂时状态有关（会话未就绪、存储不可用），稍后重发同一更新可能成功。
+    Unavailable,
+    /// 本机持久化、材料损坏、权限或安装失败；关闭交换并保留来源，不拒绝远端更新。
+    LocalFailure,
+}
+
+/// 根据完整 source 与动作分类：可识别暂时环境故障为 `Unavailable`，本机能力失败为
+/// `LocalFailure`，验证更新的失败才为 `Rejected`；未知失败不会被自动当成暂时错误。
+pub fn group_update_apply_verdict(error: &KeyEpochError) -> GroupUpdateVerdict {
+    use uc_core::membership::KeyEpochStateIssue as State;
+    match error {
+        KeyEpochError::SpaceNotReady
+        | KeyEpochError::StateIssue(
+            State::MissingMaterial | State::MissingPredecessor | State::UnverifiedReplay,
+        ) => {
+            return GroupUpdateVerdict::Unavailable;
+        }
+        KeyEpochError::Repository(_) | KeyEpochError::SecurityState { .. } => {}
+        KeyEpochError::StateIssue(State::CorruptMaterial | State::StateChanged) => {
+            return GroupUpdateVerdict::LocalFailure;
+        }
+        _ => return GroupUpdateVerdict::Rejected,
+    }
+    let mut environmental = false;
+    let mut judges_update = false;
+    let mut local_operation = false;
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        if let Some(context) = error.downcast_ref::<GroupUpdateFailure>() {
+            local_operation |= matches!(context.action, GroupUpdateAction::LoadState | GroupUpdateAction::PersistState | GroupUpdateAction::InstallSecurityState);
+            judges_update |= matches!(
+                context.action,
+                GroupUpdateAction::DecodeUpdate
+                    | GroupUpdateAction::ApplySecurityUpdate
+                    | GroupUpdateAction::ValidateUpdate
+            );
+        } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            environmental |= matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::ResourceBusy
+                    | std::io::ErrorKind::StorageFull
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            );
+        } else if let Some(classified) = error.downcast_ref::<uc_observability_contract::diagnostics::connectivity::ClassifiedGroupUpdateStorageFailure>() {
+            // 数据库忙/锁等暂时失败在存储层只能归为 Unknown（不能从库错误正文推断），所以 Unknown 也算暂时；
+            // 约束、损坏、权限与缺失说明存储本身有待处理的问题，不当作稍后会好的暂时失败。
+            use uc_observability_contract::diagnostics::connectivity::GroupUpdateReason as Reason;
+            environmental |= matches!(
+                classified.reason,
+                Reason::Unavailable | Reason::Locked | Reason::Conflict | Reason::Unknown
+            );
+        } else if let Some(error) = error.downcast_ref::<uc_core::crypto::EncryptionError>() {
+            environmental |= matches!(
+                error,
+                uc_core::crypto::EncryptionError::Locked
+                    | uc_core::crypto::EncryptionError::NotInitialized
+            );
+        }
+        current = error.source();
+    }
+    if environmental && !judges_update {
+        GroupUpdateVerdict::Unavailable
+    } else if local_operation || !judges_update {
+        GroupUpdateVerdict::LocalFailure
+    } else {
+        GroupUpdateVerdict::Rejected
+    }
+}
+
+pub fn group_update_failure_detail(
+    error: &KeyEpochError,
+) -> uc_observability_contract::diagnostics::connectivity::GroupUpdateFailureDetail {
+    use uc_core::membership::KeyEpochStateIssue as State;
+    use uc_observability_contract::diagnostics::connectivity::{
+        GroupUpdateFailureDetail, GroupUpdatePhase as Phase, GroupUpdateReason as Reason,
+        GroupUpdateSource as Source,
+    };
+    let mut detail = GroupUpdateFailureDetail {
+        phase: Phase::Unknown,
+        reason: Reason::Unknown,
+        source: Source::Unknown,
+    };
+    if let KeyEpochError::StateIssue(state) = error {
+        detail.source = Source::State;
+        (detail.phase, detail.reason) = match state {
+            State::MissingMaterial | State::MissingRevocation | State::MissingStage => {
+                (Phase::LoadState, Reason::NotFound)
+            }
+            State::CorruptMaterial => (Phase::LoadState, Reason::Corrupt),
+            State::UnsupportedUpdate => (Phase::ValidateUpdate, Reason::UnsupportedVersion),
+            State::OutOfOrderUpdate
+            | State::MissingPredecessor
+            | State::UnverifiedReplay
+            | State::StateChanged
+            | State::InvalidStage => (Phase::ValidateUpdate, Reason::Conflict),
+            State::EpochMismatch => (Phase::ApplySecurityUpdate, Reason::Conflict),
+            _ => (Phase::Unknown, Reason::Unknown),
+        };
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        if let Some(context) = error.downcast_ref::<GroupUpdateFailure>() {
+            if matches!(detail.phase, Phase::Unknown) {
+                detail.phase = match context.action {
+                    GroupUpdateAction::DecodeUpdate => Phase::DecodeUpdate,
+                    GroupUpdateAction::ValidateUpdate => Phase::ValidateUpdate,
+                    GroupUpdateAction::LoadState => Phase::LoadState,
+                    GroupUpdateAction::ApplySecurityUpdate => Phase::ApplySecurityUpdate,
+                    GroupUpdateAction::PersistState => Phase::PersistState,
+                    GroupUpdateAction::InstallSecurityState => Phase::InstallSecurityState,
+                };
+            }
+        } else if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            detail.source = Source::Io;
+            detail.reason = match error.kind() {
+                std::io::ErrorKind::PermissionDenied => Reason::PermissionDenied,
+                std::io::ErrorKind::NotFound => Reason::NotFound,
+                std::io::ErrorKind::AlreadyExists => Reason::Conflict,
+                std::io::ErrorKind::InvalidData => Reason::Corrupt,
+                std::io::ErrorKind::InvalidInput => Reason::Constraint,
+                std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::TimedOut => Reason::Unavailable,
+                _ => Reason::Unknown,
+            };
+        } else if error.is::<serde_json::Error>() {
+            detail.source = Source::Decoder;
+            detail.reason = Reason::Corrupt;
+        } else if let Some(error) = error.downcast_ref::<uc_core::crypto::EncryptionError>() {
+            detail.source = Source::Security;
+            detail.reason = match error {
+                uc_core::crypto::EncryptionError::Locked => Reason::Locked,
+                uc_core::crypto::EncryptionError::NotInitialized => Reason::Unavailable,
+                uc_core::crypto::EncryptionError::CorruptedBlob
+                | uc_core::crypto::EncryptionError::CorruptedKeySlot => Reason::Corrupt,
+                _ => Reason::Unknown,
+            };
+        } else if let Some(classified) = error.downcast_ref::<uc_observability_contract::diagnostics::connectivity::ClassifiedGroupUpdateStorageFailure>() {
+            // 存储层（Diesel/SQLite）已经在真实错误转换处把分类算好；这里只读
+            // 结果，不认识任何存储库的具体错误类型，保持本 crate 无数据库依赖。
+            detail.source = Source::Storage;
+            detail.reason = classified.reason;
+        }
+        current = error.source();
+    }
+    detail
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uc_observability_contract::diagnostics::connectivity::{
+        ClassifiedGroupUpdateStorageFailure, GroupUpdateReason,
+    };
+
+    #[test]
+    fn local_permission_corruption_and_install_failures_do_not_reject_remote_updates() {
+        for action in [
+            GroupUpdateAction::LoadState,
+            GroupUpdateAction::PersistState,
+            GroupUpdateAction::InstallSecurityState,
+        ] {
+            for kind in [
+                std::io::ErrorKind::PermissionDenied,
+                std::io::ErrorKind::InvalidData,
+            ] {
+                let error = failed_action(action, std::io::Error::from(kind));
+                assert_eq!(
+                    group_update_apply_verdict(&error),
+                    GroupUpdateVerdict::LocalFailure
+                );
+                assert!(std::error::Error::source(&error).is_some());
+            }
+        }
+        let invalid = failed_action(
+            GroupUpdateAction::ApplySecurityUpdate,
+            std::io::Error::from(std::io::ErrorKind::InvalidData),
+        );
+        assert_eq!(
+            group_update_apply_verdict(&invalid),
+            GroupUpdateVerdict::Rejected
+        );
+    }
+
+    /// 本 crate 不接触任何存储库的具体错误类型；真实 Diesel/SQLite 失败如何
+    /// 被翻译成 `ClassifiedGroupUpdateStorageFailure` 由存储层的转换处验证
+    /// （`uc-infra-storage` 的 `db::repositories::space_security_store::backend`）。
+    /// 这里只验证读取端：已经分类好的存储失败正确映射到 phase/source/reason，
+    /// 且不泄露任何底层错误文本。
+    #[test]
+    fn a_classified_storage_failure_keeps_the_persist_stage_and_safe_source_category() {
+        let classified = ClassifiedGroupUpdateStorageFailure::new(
+            GroupUpdateReason::Unknown,
+            anyhow::anyhow!("PRIVATE_MISSING_TABLE"),
+        );
+        let error = failed_action(GroupUpdateAction::PersistState, classified);
+        let detail = group_update_failure_detail(&error);
+        assert_eq!(detail.phase.as_str(), "persist_state");
+        assert_eq!(detail.source.as_str(), "storage");
+        assert_eq!(detail.reason.as_str(), "unknown");
+        assert!(!error.to_string().contains("PRIVATE_"));
+        assert!(!format!("{error:?}").contains("PRIVATE_"));
+    }
+}

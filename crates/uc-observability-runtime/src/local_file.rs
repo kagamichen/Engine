@@ -11,6 +11,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use uc_observability_contract::diagnostics::{managed_log_file_date, managed_log_file_name};
 
 use crate::file_statistics::{increment, FileSourceCounts, FileStatistics, LocalDiagnosticSource};
+use crate::remote_health::{record_local_file_failed, record_local_file_recovered};
 use crate::{SignalResult, LOCAL_LOG_MAX_BYTES, LOCAL_LOG_RETENTION_DAYS};
 
 const ASYNC_QUEUE_CAPACITY: usize = 4_096;
@@ -20,6 +21,8 @@ pub(crate) struct BoundedDailyMakeWriter {
     state: Arc<Mutex<WriterState>>,
     dropped_records: Arc<AtomicU64>,
     statistics: Arc<FileStatistics>,
+    /// 最近一次落盘是否失败；由文件线程在状态变化时更新，`health()` 据此动态报告。
+    unavailable: Arc<AtomicBool>,
 }
 
 impl BoundedDailyMakeWriter {
@@ -38,6 +41,7 @@ impl BoundedDailyMakeWriter {
                 state: Arc::new(Mutex::new(state)),
                 dropped_records: Arc::clone(&dropped_records),
                 statistics: Arc::new(FileStatistics::default()),
+                unavailable: Arc::new(AtomicBool::new(false)),
             },
             dropped_records,
         ))
@@ -74,25 +78,115 @@ pub(crate) struct BoundedDailyWriter {
     owner: BoundedDailyMakeWriter,
 }
 
+/// 文件线程内的落盘策略。Engine 日文件与独立网络日志各实现一份，队列、封口、刷新与恢复共用同一套机制。
+///
+/// `source` 是调用方定义的来源序号，队列只原样透传给计数器与策略。
+pub(crate) trait RecordStore: Send + 'static {
+    /// 线程启动后立即调用一次；失败按写入失败处理并进入退避重试，后续写入或刷新会再次尝试。
+    fn prepare(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn store_record(&mut self, bytes: &[u8], source: usize) -> io::Result<()>;
+    fn settle(&mut self) -> io::Result<()>;
+
+    /// 暂时交还本策略持有的全部文件：先落盘，再关闭。之后不再打开任何文件，直到 [`Self::unpark`]。
+    /// 只有持有需交还文件（租约）的策略实现；其余策略没有可交还的内容。
+    fn park(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// 结束停车并重新打开；没有停车时什么也不做。
+    fn unpark(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 队列侧的按来源计数；写入策略自己的落盘计数不经过这里。
+pub(crate) trait RecordCounters: Send + Sync + 'static {
+    fn accepted(&self, source: usize);
+    fn queue_dropped(&self, source: usize);
+    /// 队列已封口后到达的记录；没有单独统计的计数器把它并入队列丢弃。
+    fn closed_dropped(&self, source: usize) {
+        self.queue_dropped(source);
+    }
+    fn write_failed(&self, source: usize);
+}
+
+/// 文件线程在可用性变化时的通知；Engine 日文件写固定健康记录，网络日志只更新自己的状态。
+#[derive(Clone, Copy)]
+pub(crate) struct HealthHooks {
+    pub(crate) failed: fn(&'static str),
+    pub(crate) recovered: fn(),
+}
+
+impl HealthHooks {
+    pub(crate) const ENGINE: Self = Self {
+        failed: record_local_file_failed,
+        recovered: record_local_file_recovered,
+    };
+}
+
+impl RecordCounters for FileStatistics {
+    fn accepted(&self, source: usize) {
+        increment(&self.source_at(source).accepted);
+    }
+
+    fn queue_dropped(&self, source: usize) {
+        increment(&self.source_at(source).queue_dropped);
+    }
+
+    fn write_failed(&self, source: usize) {
+        increment(&self.source_at(source).write_failed);
+    }
+}
+
+impl RecordStore for BoundedDailyMakeWriter {
+    fn store_record(&mut self, bytes: &[u8], source: usize) -> io::Result<()> {
+        BoundedDailyMakeWriter::write_record(
+            self,
+            bytes,
+            LocalDiagnosticSource::ALL
+                .get(source)
+                .copied()
+                .unwrap_or(LocalDiagnosticSource::Runtime),
+        )
+    }
+
+    fn settle(&mut self) -> io::Result<()> {
+        Write::flush(self)
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AsyncFileWriter {
     sender: mpsc::SyncSender<FileMessage>,
     dropped_records: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
+    /// 停车期间到达的记录与封口后一样直接丢弃，不进入队列，也不让文件线程重新打开文件。
+    parked: Arc<AtomicBool>,
     submission: Arc<Mutex<()>>,
-    statistics: Arc<FileStatistics>,
+    counters: Arc<dyn RecordCounters>,
 }
 
-pub(crate) struct LocalFileRuntime {
+/// 一个独立的有界文件队列：写入句柄、工作线程与可用性状态。
+pub(crate) struct FileQueue {
     writer: AsyncFileWriter,
     worker: Arc<LocalFileWorker>,
     dropped_records: Arc<AtomicU64>,
+    unavailable: Arc<AtomicBool>,
+}
+
+pub(crate) struct LocalFileRuntime {
+    queue: FileQueue,
+    statistics: Arc<FileStatistics>,
 }
 
 struct LocalFileWorker {
     sender: mpsc::SyncSender<FileMessage>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
     closed: Arc<AtomicBool>,
+    parked: Arc<AtomicBool>,
     submission: Arc<Mutex<()>>,
     shutdown: Arc<FileShutdownCoordinator>,
 }
@@ -125,8 +219,10 @@ impl Default for FileShutdownCoordinator {
 }
 
 enum FileMessage {
-    Line(Vec<u8>, LocalDiagnosticSource),
+    Line(Vec<u8>, usize),
     Flush(mpsc::Sender<bool>),
+    Park(mpsc::Sender<bool>),
+    Unpark(mpsc::Sender<bool>),
     Shutdown(mpsc::Sender<bool>),
 }
 
@@ -143,20 +239,88 @@ impl LocalFileRuntime {
     fn new_internal(directory: &Path, retention_days: u64, max_bytes: u64) -> io::Result<Self> {
         let (writer, dropped_records) =
             BoundedDailyMakeWriter::new_with_limits(directory, retention_days, max_bytes)?;
+        let unavailable = Arc::clone(&writer.unavailable);
+        let statistics = Arc::clone(&writer.statistics);
         let (writer, worker) = non_blocking_file_writer(writer, Arc::clone(&dropped_records))?;
+        Ok(Self {
+            queue: FileQueue {
+                writer,
+                worker,
+                dropped_records,
+                unavailable,
+            },
+            statistics,
+        })
+    }
+
+    pub(crate) fn record_rejection(&self) {
+        self.queue.record_rejection();
+    }
+
+    pub(crate) fn statistics(&self) -> Vec<FileSourceCounts> {
+        self.statistics.snapshot()
+    }
+
+    pub(crate) fn writer(&self) -> AsyncFileWriter {
+        self.queue.writer()
+    }
+
+    pub(crate) fn dropped_records(&self) -> u64 {
+        self.queue.dropped_records()
+    }
+
+    /// 最近一次写入或刷新失败且尚未恢复。
+    pub(crate) fn unavailable(&self) -> bool {
+        self.queue.unavailable()
+    }
+
+    pub(crate) fn flush(&self, deadline: Duration) -> bool {
+        self.queue.flush(deadline)
+    }
+
+    pub(crate) fn flush_result(&self, deadline: Duration) -> SignalResult {
+        self.queue.flush_result(deadline)
+    }
+
+    pub(crate) fn shutdown(&self, deadline: Duration) -> bool {
+        self.queue.shutdown(deadline)
+    }
+
+    pub(crate) fn shutdown_cleanup_incomplete(&self) -> bool {
+        self.queue.shutdown_cleanup_incomplete()
+    }
+}
+
+impl FileQueue {
+    /// 在独立线程上启动队列；`store` 与线程只属于这一个队列。
+    pub(crate) fn spawn<S: RecordStore>(
+        store: S,
+        counters: Arc<dyn RecordCounters>,
+        hooks: HealthHooks,
+        thread_name: &str,
+        capacity: usize,
+    ) -> io::Result<Self> {
+        let dropped_records = Arc::new(AtomicU64::new(0));
+        let unavailable = Arc::new(AtomicBool::new(false));
+        let (writer, worker) = spawn_file_queue(
+            store,
+            counters,
+            Arc::clone(&dropped_records),
+            Arc::clone(&unavailable),
+            hooks,
+            thread_name,
+            capacity,
+        )?;
         Ok(Self {
             writer,
             worker,
             dropped_records,
+            unavailable,
         })
     }
 
     pub(crate) fn record_rejection(&self) {
         increment(&self.dropped_records);
-    }
-
-    pub(crate) fn statistics(&self) -> Vec<FileSourceCounts> {
-        self.writer.statistics.snapshot()
     }
 
     pub(crate) fn writer(&self) -> AsyncFileWriter {
@@ -167,12 +331,16 @@ impl LocalFileRuntime {
         self.dropped_records.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn unavailable(&self) -> bool {
+        self.unavailable.load(Ordering::Acquire)
+    }
+
     pub(crate) fn flush(&self, deadline: Duration) -> bool {
         self.worker.flush(deadline)
     }
 
     pub(crate) fn flush_result(&self, deadline: Duration) -> SignalResult {
-        self.worker.flush_result(deadline)
+        self.worker.signal(FileMessage::Flush, deadline, || {})
     }
 
     pub(crate) fn shutdown(&self, deadline: Duration) -> bool {
@@ -182,32 +350,74 @@ impl LocalFileRuntime {
     pub(crate) fn shutdown_cleanup_incomplete(&self) -> bool {
         self.worker.shutdown_cleanup_incomplete()
     }
+
+    pub(crate) fn park(&self, deadline: Duration) -> SignalResult {
+        self.worker.park(deadline)
+    }
+
+    pub(crate) fn unpark(&self, deadline: Duration) -> SignalResult {
+        self.worker.unpark(deadline)
+    }
 }
 
 fn non_blocking_file_writer(
     writer: BoundedDailyMakeWriter,
     dropped_records: Arc<AtomicU64>,
 ) -> io::Result<(AsyncFileWriter, Arc<LocalFileWorker>)> {
-    let statistics = Arc::clone(&writer.statistics);
-    let (sender, receiver) = mpsc::sync_channel(ASYNC_QUEUE_CAPACITY);
+    let counters: Arc<dyn RecordCounters> = Arc::clone(&writer.statistics) as _;
+    let unavailable = Arc::clone(&writer.unavailable);
+    spawn_file_queue(
+        writer,
+        counters,
+        dropped_records,
+        unavailable,
+        HealthHooks::ENGINE,
+        "uc-observability-file",
+        ASYNC_QUEUE_CAPACITY,
+    )
+}
+
+fn spawn_file_queue<S: RecordStore>(
+    store: S,
+    counters: Arc<dyn RecordCounters>,
+    dropped_records: Arc<AtomicU64>,
+    unavailable: Arc<AtomicBool>,
+    hooks: HealthHooks,
+    thread_name: &str,
+    capacity: usize,
+) -> io::Result<(AsyncFileWriter, Arc<LocalFileWorker>)> {
+    let (sender, receiver) = mpsc::sync_channel(capacity);
     let closed = Arc::new(AtomicBool::new(false));
+    let parked = Arc::new(AtomicBool::new(false));
     let submission = Arc::new(Mutex::new(()));
     let worker_dropped_records = Arc::clone(&dropped_records);
+    let worker_counters = Arc::clone(&counters);
     let thread = std::thread::Builder::new()
-        .name("uc-observability-file".to_owned())
-        .spawn(move || run_file_worker(writer, receiver, worker_dropped_records))?;
+        .name(thread_name.to_owned())
+        .spawn(move || {
+            run_file_worker(
+                store,
+                receiver,
+                worker_dropped_records,
+                worker_counters,
+                unavailable,
+                hooks,
+            )
+        })?;
     Ok((
         AsyncFileWriter {
             sender: sender.clone(),
             dropped_records,
             closed: Arc::clone(&closed),
+            parked: Arc::clone(&parked),
             submission: Arc::clone(&submission),
-            statistics,
+            counters,
         },
         Arc::new(LocalFileWorker {
             sender,
             thread: Arc::new(Mutex::new(Some(thread))),
             closed,
+            parked,
             submission,
             shutdown: Arc::new(FileShutdownCoordinator::default()),
         }),
@@ -216,26 +426,25 @@ fn non_blocking_file_writer(
 
 impl AsyncFileWriter {
     pub(crate) fn write_record(&self, buffer: &[u8], source: LocalDiagnosticSource) {
-        let statistics = self.statistics.source(source);
-        let _submission = match self.submission.try_lock() {
-            Ok(submission) => submission,
-            Err(TryLockError::WouldBlock) => {
-                increment(&self.dropped_records);
-                increment(&statistics.queue_dropped);
-                return;
-            }
-            Err(TryLockError::Poisoned(error)) => error.into_inner(),
-        };
-        if self.closed.load(Ordering::Acquire)
-            || self
-                .sender
-                .try_send(FileMessage::Line(buffer.to_vec(), source))
-                .is_err()
+        self.write_indexed(buffer, source as usize);
+    }
+
+    pub(crate) fn write_indexed(&self, buffer: &[u8], source: usize) {
+        // 门只保护封口与入队的先后顺序，持有者只做不阻塞的 `try_send`，所以这里等待锁不会等待磁盘或网络；
+        // 争用本身不得丢记录，只有队列已满或已封口才计入丢弃。
+        let _submission = lock(&self.submission);
+        if self.closed.load(Ordering::Acquire) || self.parked.load(Ordering::Acquire) {
+            increment(&self.dropped_records);
+            self.counters.closed_dropped(source);
+        } else if self
+            .sender
+            .try_send(FileMessage::Line(buffer.to_vec(), source))
+            .is_err()
         {
             increment(&self.dropped_records);
-            increment(&statistics.queue_dropped);
+            self.counters.queue_dropped(source);
         } else {
-            increment(&statistics.accepted);
+            self.counters.accepted(source);
         }
     }
 }
@@ -266,37 +475,67 @@ impl LocalFileWorker {
     }
 
     pub(crate) fn flush(&self, deadline: Duration) -> bool {
-        self.flush_result(deadline) == SignalResult::Completed
+        self.signal(FileMessage::Flush, deadline, || {}) == SignalResult::Completed
     }
 
-    pub(crate) fn flush_result(&self, deadline: Duration) -> SignalResult {
-        let started = Instant::now();
-        let (sender, receiver) = mpsc::channel();
-        let mut message = FileMessage::Flush(sender);
+    /// 先在提交门内停止接收新记录，再把停车请求排在已入队记录之后：已接受的记录全部落盘后才交还文件。
+    pub(crate) fn park(&self, deadline: Duration) -> SignalResult {
         {
-            let Some(_submission) = lock_before_deadline(&self.submission, started, deadline)
-            else {
-                return SignalResult::TimedOut;
-            };
-            if started.elapsed() >= deadline {
-                return SignalResult::TimedOut;
-            }
+            let _submission = lock(&self.submission);
             if self.closed.load(Ordering::Acquire) {
                 return SignalResult::AlreadyShutdown;
             }
-            loop {
+            self.parked.store(true, Ordering::Release);
+        }
+        self.signal(FileMessage::Park, deadline, || {})
+    }
+
+    /// 重开请求入队与放行写入在同一提交门内完成：之后到达的记录必然排在重开之后。
+    pub(crate) fn unpark(&self, deadline: Duration) -> SignalResult {
+        self.signal(FileMessage::Unpark, deadline, || {
+            self.parked.store(false, Ordering::Release);
+        })
+    }
+
+    /// 把一次带回复的控制请求（刷新、停车、重开）排入队列并等待回复；`enqueued` 在请求入队后、仍持有提交门时执行。
+    fn signal(
+        &self,
+        request: fn(mpsc::Sender<bool>) -> FileMessage,
+        deadline: Duration,
+        enqueued: impl FnOnce(),
+    ) -> SignalResult {
+        let started = Instant::now();
+        let (sender, receiver) = mpsc::channel();
+        let mut message = request(sender);
+        let mut enqueued = Some(enqueued);
+        loop {
+            // 队列已满时在两次尝试之间释放提交门，等待期间不阻塞写入方。
+            {
+                let Some(_submission) = lock_before_deadline(&self.submission, started, deadline)
+                else {
+                    return SignalResult::TimedOut;
+                };
+                if started.elapsed() >= deadline {
+                    return SignalResult::TimedOut;
+                }
+                if self.closed.load(Ordering::Acquire) {
+                    return SignalResult::AlreadyShutdown;
+                }
                 match self.sender.try_send(message) {
-                    Ok(()) => break,
-                    Err(mpsc::TrySendError::Full(returned)) => {
-                        if started.elapsed() >= deadline {
-                            return SignalResult::TimedOut;
+                    Ok(()) => {
+                        if let Some(enqueued) = enqueued.take() {
+                            enqueued();
                         }
-                        message = returned;
-                        std::thread::sleep(Duration::from_millis(1));
+                        break;
                     }
+                    Err(mpsc::TrySendError::Full(returned)) => message = returned,
                     Err(mpsc::TrySendError::Disconnected(_)) => return SignalResult::Failed,
                 }
             }
+            if started.elapsed() >= deadline {
+                return SignalResult::TimedOut;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
         match receiver.recv_timeout(deadline.saturating_sub(started.elapsed())) {
             Ok(true) => SignalResult::Completed,
@@ -404,53 +643,132 @@ impl FileShutdownCoordinator {
     }
 }
 
-fn run_file_worker(
-    mut writer: BoundedDailyMakeWriter,
+/// 失败后的重试退避；在退避内到达的记录直接丢弃并计数，不再反复触碰失败的存储。
+const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// 文件线程内的恢复状态：写入或刷新失败进入失败态，任一次成功即恢复，不存在永久失败。
+struct WorkerHealth {
+    unavailable: Arc<AtomicBool>,
+    hooks: HealthHooks,
+    failed_since: Option<Instant>,
+    retry_at: Instant,
+    backoff: Duration,
+}
+
+impl WorkerHealth {
+    fn new(unavailable: Arc<AtomicBool>, hooks: HealthHooks) -> Self {
+        Self {
+            unavailable,
+            hooks,
+            failed_since: None,
+            retry_at: Instant::now(),
+            backoff: RETRY_BACKOFF_MIN,
+        }
+    }
+
+    fn in_backoff(&self) -> bool {
+        self.failed_since.is_some() && Instant::now() < self.retry_at
+    }
+
+    fn failed(&mut self, class: &'static str) {
+        if self.failed_since.is_none() {
+            self.failed_since = Some(Instant::now());
+            self.backoff = RETRY_BACKOFF_MIN;
+            self.unavailable.store(true, Ordering::Release);
+            (self.hooks.failed)(class);
+        } else {
+            self.backoff = (self.backoff * 2).min(RETRY_BACKOFF_MAX);
+        }
+        self.retry_at = Instant::now() + self.backoff;
+    }
+
+    fn succeeded(&mut self) {
+        if self.failed_since.take().is_some() {
+            self.backoff = RETRY_BACKOFF_MIN;
+            self.unavailable.store(false, Ordering::Release);
+            (self.hooks.recovered)();
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed_since.is_some()
+    }
+}
+
+fn run_file_worker<S: RecordStore>(
+    mut writer: S,
     receiver: mpsc::Receiver<FileMessage>,
     dropped_records: Arc<AtomicU64>,
+    counters: Arc<dyn RecordCounters>,
+    unavailable: Arc<AtomicBool>,
+    hooks: HealthHooks,
 ) {
-    let mut healthy = true;
+    let mut health = WorkerHealth::new(unavailable, hooks);
+    if writer.prepare().is_err() {
+        health.failed("open_failed");
+    }
     while let Ok(message) = receiver.recv() {
         match message {
             FileMessage::Line(bytes, source) => {
-                if !healthy {
+                if health.in_backoff() {
                     increment(&dropped_records);
-                    increment(&writer.statistics.source(source).write_failed);
-                } else if writer.write_record(&bytes, source).is_err() {
+                    counters.write_failed(source);
+                } else if writer.store_record(&bytes, source).is_err() {
                     increment(&dropped_records);
-                    increment(&writer.statistics.source(source).write_failed);
-                    healthy = false;
+                    counters.write_failed(source);
+                    health.failed("write_failed");
+                } else {
+                    health.succeeded();
                 }
             }
             FileMessage::Flush(reply) => {
-                if healthy && writer.flush().is_err() {
-                    healthy = false;
+                // 刷新是明确的重试点：失败态下也尝试重新打开，不受退避限制。
+                let _ = reply.send(settle_flush(&mut writer, &mut health));
+            }
+            FileMessage::Park(reply) => {
+                let _ = reply.send(writer.park().is_ok());
+            }
+            FileMessage::Unpark(reply) => {
+                let reopened = writer.unpark().is_ok();
+                if reopened {
+                    health.succeeded();
+                } else {
+                    health.failed("open_failed");
                 }
-                let _ = reply.send(healthy);
+                let _ = reply.send(reopened);
             }
             FileMessage::Shutdown(reply) => {
-                if healthy && writer.flush().is_err() {
-                    healthy = false;
-                }
-                let _ = reply.send(healthy);
+                let _ = reply.send(settle_flush(&mut writer, &mut health));
                 return;
             }
         }
     }
 }
 
+fn settle_flush<S: RecordStore>(writer: &mut S, health: &mut WorkerHealth) -> bool {
+    if writer.settle().is_ok() {
+        health.succeeded();
+    } else {
+        health.failed("flush_failed");
+    }
+    !health.is_failed()
+}
+
 impl BoundedDailyMakeWriter {
     fn write_record(&self, buffer: &[u8], source: LocalDiagnosticSource) -> io::Result<()> {
         let mut state = lock(&self.state);
         state.rotate_if_needed()?;
+        state.ensure_current()?;
         let additional = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
-        if state.total_bytes.saturating_add(additional) > state.max_bytes {
+        if !state.make_room(additional)? {
             increment(&self.dropped_records);
             increment(&self.statistics.source(source).quota_dropped);
             return Ok(());
         }
         state.file.write_all(buffer)?;
         state.total_bytes = state.total_bytes.saturating_add(additional);
+        state.current_bytes = state.current_bytes.saturating_add(additional);
         increment(&self.statistics.source(source).written);
         if let Ok(timestamp) = u64::try_from(chrono::Utc::now().timestamp_millis()) {
             self.statistics
@@ -470,7 +788,9 @@ impl Write for BoundedDailyWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        lock(&self.owner.state).file.flush()
+        let mut state = lock(&self.owner.state);
+        state.ensure_current()?;
+        state.file.flush()
     }
 }
 
@@ -479,6 +799,8 @@ struct WriterState {
     date: NaiveDate,
     file: File,
     total_bytes: u64,
+    /// 当天文件的字节数；它始终包含在 `total_bytes` 内。
+    current_bytes: u64,
     retention_days: u64,
     max_bytes: u64,
 }
@@ -490,8 +812,10 @@ impl WriterState {
         retention_days: u64,
         max_bytes: u64,
     ) -> io::Result<Self> {
+        std::fs::create_dir_all(&directory)?;
         let path = directory.join(file_name(date));
         let file = open_managed_file(&path)?;
+        let current_bytes = file.metadata()?.len();
         let total_bytes =
             managed_files(&directory)?
                 .into_iter()
@@ -506,9 +830,35 @@ impl WriterState {
             date,
             file,
             total_bytes,
+            current_bytes,
             retention_days,
             max_bytes,
         })
+    }
+
+    /// 为新记录腾出配额：从最旧的受管文件起淘汰，永不触碰当天文件（早于或晚于当天的受管文件都可淘汰，时钟回拨留下的未来日期文件也一样），使新的诊断总能写入。
+    ///
+    /// 即使淘汰全部旧文件也放不下（单条超额或当天文件独占配额）时不删除任何文件，返回
+    /// `false` 由调用方丢弃该条。只处理受管文件名，宿主放在同目录的其他文件不受影响。
+    fn make_room(&mut self, additional: u64) -> io::Result<bool> {
+        if self.total_bytes.saturating_add(additional) <= self.max_bytes {
+            return Ok(true);
+        }
+        if self.current_bytes.saturating_add(additional) > self.max_bytes {
+            return Ok(false);
+        }
+        for entry in managed_files(&self.directory)? {
+            if self.total_bytes.saturating_add(additional) <= self.max_bytes {
+                break;
+            }
+            if entry.date == self.date {
+                continue;
+            }
+            let size = entry.path.metadata()?.len();
+            std::fs::remove_file(&entry.path)?;
+            self.total_bytes = self.total_bytes.saturating_sub(size);
+        }
+        Ok(self.total_bytes.saturating_add(additional) <= self.max_bytes)
     }
 
     fn rotate_if_needed(&mut self) -> io::Result<()> {
@@ -516,6 +866,7 @@ impl WriterState {
         if today == self.date {
             return Ok(());
         }
+        std::fs::create_dir_all(&self.directory)?;
         cleanup(&self.directory, today, self.retention_days, self.max_bytes)?;
         *self = Self::open(
             self.directory.clone(),
@@ -525,9 +876,40 @@ impl WriterState {
         )?;
         Ok(())
     }
+
+    /// 打开的文件仍是目录里的当天文件；目录或文件被外部删除、替换后重建并重新统计配额。
+    ///
+    /// 已打开的描述符在文件被删除后依旧可写，记录会静默落入不可达的文件，所以每次写入前都核对路径。
+    fn ensure_current(&mut self) -> io::Result<()> {
+        let path = self.directory.join(file_name(self.date));
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| same_file(&metadata, &self.file)) {
+            return Ok(());
+        }
+        *self = Self::open(
+            self.directory.clone(),
+            self.date,
+            self.retention_days,
+            self.max_bytes,
+        )?;
+        Ok(())
+    }
 }
 
-fn open_managed_file(path: &Path) -> io::Result<File> {
+#[cfg(unix)]
+pub(crate) fn same_file(path_metadata: &std::fs::Metadata, file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    file.metadata().is_ok_and(|opened| {
+        opened.dev() == path_metadata.dev() && opened.ino() == path_metadata.ino()
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn same_file(path_metadata: &std::fs::Metadata, _file: &File) -> bool {
+    path_metadata.is_file()
+}
+
+pub(crate) fn open_managed_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).append(true);
     prevent_symlink_follow(&mut options);
@@ -613,11 +995,53 @@ fn cleanup(
         if total <= max_bytes {
             break;
         }
+        // 当天文件正在或即将被写入，即使独占配额也不在这里淘汰。
+        if entry.date == today {
+            continue;
+        }
         let size = entry.path.metadata()?.len();
         std::fs::remove_file(entry.path)?;
         total = total.saturating_sub(size);
     }
     Ok(())
+}
+
+/// 把旧目录里的受管日志文件一次性迁入新目录，返回迁入的文件数。
+///
+/// 只处理严格命名的日志文件；新目录已有同名文件时保留两份，不覆盖也不合并。必须在写入器打开新目录之前调用。
+/// 同一文件系统内用重命名，跨文件系统时复制后删除源文件；任一文件失败即返回错误，已迁入的文件保留在新目录，
+/// 重复调用会继续迁移剩余文件。
+pub fn migrate_managed_log_files(from: &Path, to: &Path) -> io::Result<usize> {
+    if from == to {
+        return Ok(0);
+    }
+    let files = match managed_files(from) {
+        Ok(files) => files,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if files.is_empty() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(to)?;
+    let mut moved = 0;
+    for entry in files {
+        let Some(name) = entry.path.file_name() else {
+            continue;
+        };
+        let destination = to.join(name);
+        if destination.try_exists()? {
+            continue;
+        }
+        if std::fs::rename(&entry.path, &destination).is_err() {
+            std::fs::copy(&entry.path, &destination)?;
+            std::fs::remove_file(&entry.path)?;
+        }
+        moved += 1;
+    }
+    // 旧目录已空时顺带移除；非空（宿主放了其他文件）则保持不动。
+    let _ = std::fs::remove_dir(from);
+    Ok(moved)
 }
 
 pub fn managed_log_files(directory: &Path) -> io::Result<Vec<PathBuf>> {
@@ -628,7 +1052,7 @@ fn file_name(date: NaiveDate) -> String {
     managed_log_file_name(date)
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -717,6 +1141,119 @@ mod tests {
         assert_eq!(dropped.load(Ordering::Relaxed), 1);
     }
 
+    fn managed_file(directory: &Path, date: &str, bytes: usize) -> PathBuf {
+        let path = directory.join(format!("engine.{date}.jsonl"));
+        std::fs::write(&path, vec![b'x'; bytes]).expect("managed file");
+        path
+    }
+
+    #[test]
+    fn full_quota_evicts_the_oldest_managed_file_for_a_new_record() {
+        let directory = tempdir().expect("temp dir");
+        let oldest = managed_file(directory.path(), "2000-01-01", 4);
+        let newer = managed_file(directory.path(), "2000-01-02", 5);
+        let unmanaged = directory.path().join("keep.txt");
+        std::fs::write(&unmanaged, b"private host file").expect("unmanaged");
+        let (mut writer, dropped) =
+            BoundedDailyMakeWriter::new_with_limits(directory.path(), 36_500, 10)
+                .expect("bounded writer");
+
+        writer.write_all(b"12345").expect("new record");
+        writer.flush().expect("flush");
+
+        assert!(!oldest.exists());
+        assert!(newer.exists());
+        assert!(unmanaged.exists());
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        let today = directory.path().join(file_name(Utc::now().date_naive()));
+        assert_eq!(std::fs::read(today).expect("today"), b"12345");
+    }
+
+    #[test]
+    fn record_larger_than_the_whole_quota_is_dropped_without_evicting_anything() {
+        let directory = tempdir().expect("temp dir");
+        let old = managed_file(directory.path(), "2000-01-01", 4);
+        let (mut writer, dropped) =
+            BoundedDailyMakeWriter::new_with_limits(directory.path(), 36_500, 10)
+                .expect("bounded writer");
+
+        writer
+            .write_all(&[b'y'; 11])
+            .expect("dropped record is non-fatal");
+
+        assert!(old.exists());
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn current_day_file_is_never_evicted_to_make_room() {
+        let directory = tempdir().expect("temp dir");
+        let (mut writer, dropped) =
+            BoundedDailyMakeWriter::new_with_limits(directory.path(), 36_500, 10)
+                .expect("bounded writer");
+
+        writer.write_all(b"12345678").expect("first record");
+        writer
+            .write_all(b"abcd")
+            .expect("dropped record is non-fatal");
+        writer.flush().expect("flush");
+
+        let today = directory.path().join(file_name(Utc::now().date_naive()));
+        assert_eq!(std::fs::read(today).expect("today"), b"12345678");
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn future_dated_managed_files_can_be_evicted_after_a_clock_rollback() {
+        let directory = tempdir().expect("temp dir");
+        let future = managed_file(directory.path(), "2999-01-01", 8);
+        let (mut writer, dropped) =
+            BoundedDailyMakeWriter::new_with_limits(directory.path(), 36_500, 10)
+                .expect("bounded writer");
+
+        writer.write_all(b"12345").expect("new record");
+        writer.flush().expect("flush");
+
+        assert!(!future.exists());
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cleanup_never_removes_the_current_day_file_even_when_it_alone_exceeds_the_cap() {
+        let directory = tempdir().expect("temp dir");
+        let today = NaiveDate::from_ymd_opt(2026, 9, 4).expect("date");
+        let older = managed_file(directory.path(), "2026-09-03", 3);
+        let current = managed_file(directory.path(), "2026-09-04", 20);
+
+        cleanup(directory.path(), today, 7, 5).expect("cleanup");
+
+        assert!(!older.exists());
+        assert!(current.exists());
+    }
+
+    #[test]
+    fn day_rollover_recreates_a_directory_removed_while_the_writer_was_open() {
+        let root = tempdir().expect("temp dir");
+        let directory = root.path().join("logs");
+        std::fs::create_dir(&directory).expect("log directory");
+        let yesterday = Utc::now()
+            .date_naive()
+            .checked_sub_days(Days::new(1))
+            .expect("date");
+        let mut state =
+            WriterState::open(directory.clone(), yesterday, 7, 1_024).expect("yesterday file");
+        std::fs::remove_dir_all(&directory).expect("remove directory");
+
+        state
+            .rotate_if_needed()
+            .expect("rotation recreates the directory");
+        state.ensure_current().expect("current file");
+
+        state.file.write_all(b"after-rollover\n").expect("write");
+        let today = directory.join(file_name(Utc::now().date_naive()));
+        assert_eq!(std::fs::read(today).expect("today"), b"after-rollover\n");
+    }
+
     #[test]
     fn explicit_flush_waits_until_all_queued_records_are_readable() {
         let directory = tempdir().expect("temp dir");
@@ -758,7 +1295,7 @@ mod tests {
             .sender
             .try_send(FileMessage::Line(
                 b"before-flush\n".to_vec(),
-                LocalDiagnosticSource::Runtime,
+                LocalDiagnosticSource::Runtime as usize,
             ))
             .expect("line accepted before flush");
         drop(submission);
@@ -779,6 +1316,7 @@ mod tests {
             sender,
             thread: Arc::new(Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
+            parked: Arc::new(AtomicBool::new(false)),
             submission: Arc::new(Mutex::new(())),
             shutdown: Arc::new(FileShutdownCoordinator::default()),
         });
@@ -800,7 +1338,7 @@ mod tests {
 
         let started = Instant::now();
         assert_eq!(
-            worker.flush_result(Duration::from_millis(5)),
+            worker.signal(FileMessage::Flush, Duration::from_millis(5), || {}),
             SignalResult::TimedOut
         );
         assert!(started.elapsed() < Duration::from_millis(50));
@@ -847,6 +1385,7 @@ mod tests {
             sender,
             thread: Arc::new(Mutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
+            parked: Arc::new(AtomicBool::new(false)),
             submission: Arc::new(Mutex::new(())),
             shutdown: Arc::new(FileShutdownCoordinator::default()),
         });
@@ -872,6 +1411,7 @@ mod tests {
             sender,
             thread: Arc::new(Mutex::new(Some(std::thread::spawn(|| {})))),
             closed: Arc::new(AtomicBool::new(false)),
+            parked: Arc::new(AtomicBool::new(false)),
             submission: Arc::new(Mutex::new(())),
             shutdown: Arc::new(FileShutdownCoordinator::default()),
         };
@@ -892,6 +1432,7 @@ mod tests {
             sender,
             thread: Arc::new(Mutex::new(Some(std::thread::spawn(|| {})))),
             closed: Arc::new(AtomicBool::new(false)),
+            parked: Arc::new(AtomicBool::new(false)),
             submission: Arc::new(Mutex::new(())),
             shutdown: Arc::new(FileShutdownCoordinator::default()),
         };
@@ -919,23 +1460,38 @@ mod tests {
     }
 
     #[test]
-    fn contended_submission_is_dropped_without_blocking_the_writer() {
-        let (sender, _receiver) = mpsc::sync_channel(1);
-        let dropped_records = Arc::new(AtomicU64::new(0));
-        let submission = Arc::new(Mutex::new(()));
-        let _held = lock(submission.as_ref());
-        let mut writer = AsyncFileWriter {
-            sender,
-            dropped_records: Arc::clone(&dropped_records),
-            closed: Arc::new(AtomicBool::new(false)),
-            submission: Arc::clone(&submission),
-            statistics: Arc::new(FileStatistics::default()),
-        };
+    fn concurrent_producers_never_lose_records_to_gate_contention() {
+        const PRODUCERS: usize = 8;
+        const PER_PRODUCER: usize = 400;
+        let directory = tempdir().expect("temp dir");
+        let runtime = LocalFileRuntime::new_with_limits(directory.path(), 7, 10_000_000)
+            .expect("local file runtime");
+        // 总量低于队列容量，任何丢弃都只能来自提交门争用。
+        assert!(PRODUCERS * PER_PRODUCER < ASYNC_QUEUE_CAPACITY);
+        let start = Arc::new(std::sync::Barrier::new(PRODUCERS));
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|_| {
+                let mut writer = runtime.writer();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..PER_PRODUCER {
+                        writer.write_all(b"record\n").expect("write");
+                    }
+                })
+            })
+            .collect();
+        for producer in producers {
+            producer.join().expect("producer");
+        }
+        assert!(runtime.flush(Duration::from_secs(5)));
 
-        let started = Instant::now();
-        writer.write_all(b"not-blocked").expect("non-fatal drop");
-
-        assert!(started.elapsed() < Duration::from_millis(50));
-        assert_eq!(dropped_records.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.dropped_records(), 0);
+        let files = managed_log_files(directory.path()).expect("files");
+        let written = std::fs::read_to_string(&files[0])
+            .expect("file")
+            .lines()
+            .count();
+        assert_eq!(written, PRODUCERS * PER_PRODUCER);
     }
 }

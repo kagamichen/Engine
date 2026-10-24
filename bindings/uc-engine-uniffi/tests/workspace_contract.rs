@@ -58,7 +58,12 @@ fn uniffi_binding_is_a_workspace_member_with_a_public_engine_boundary() {
             "zeroize",
         ])
     );
-    for forbidden in ["uc-core", "uc-application", "uc-infra", "uc-bootstrap"] {
+    for forbidden in [
+        "uc-core",
+        "uc-application",
+        "uc-infra-profile",
+        "uc-bootstrap",
+    ] {
         assert!(
             !dependencies.contains(forbidden),
             "binding must not depend directly on {forbidden}"
@@ -188,7 +193,7 @@ fn uniffi_binding_uses_the_shared_process_observability_runtime() {
     for required in [
         "ProcessObservabilityRuntime::install",
         "LocalLogConfig::new(directories.logs())",
-        "schedule_flush_after_success",
+        "schedule_flush_after_lifecycle",
     ] {
         assert!(
             observability.contains(required) || runtime.contains(required),

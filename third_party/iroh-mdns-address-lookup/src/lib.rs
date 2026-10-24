@@ -58,6 +58,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use iroh::{
@@ -71,13 +72,16 @@ use iroh_base::{EndpointId, PublicKey};
 use n0_future::{
     Stream,
     boxed::BoxStream,
-    task::{self, AbortOnDropHandle, JoinSet},
+    task::{self, AbortOnDropHandle, JoinError, JoinSet},
     time::{self, Duration},
 };
 use n0_watcher::{Watchable, Watcher as _};
 use swarm_discovery::{Discoverer, DropGuard, IpClass, Peer};
-use tokio::sync::mpsc::{self, error::TrySendError};
-use tracing::{Instrument, debug, error, info_span, trace, warn};
+use tokio::sync::{
+    Mutex,
+    mpsc::{self, error::TrySendError},
+};
+use tracing::{Dispatch, Instrument, debug, dispatcher, error, info_span, trace, warn};
 
 /// The n0 local service name.
 const N0_SERVICE_NAME: &str = "irohv1";
@@ -102,7 +106,7 @@ const RELAY_URL_ATTRIBUTE: &str = "relay";
 #[derive(Debug, Clone)]
 pub struct MdnsAddressLookup {
     #[allow(dead_code)]
-    handle: Arc<AbortOnDropHandle<()>>,
+    handle: Arc<Mutex<Option<AbortOnDropHandle<()>>>>,
     sender: mpsc::Sender<Message>,
     advertise: bool,
     /// When `local_addrs` changes, we re-publish our info.
@@ -144,7 +148,7 @@ impl Subscribers {
             if let Err(err) = subscriber.try_send(item.clone()) {
                 match err {
                     TrySendError::Full(_) => {
-                        warn!(?item, idx = i, "mdns subscriber is blocked, dropping item")
+                        warn!(idx = i, "mdns subscriber is blocked, dropping item")
                     }
                     TrySendError::Closed(_) => clean_up.push(i),
                 }
@@ -385,26 +389,20 @@ impl MdnsAddressLookup {
                             "adding endpoint to Mdns address book"
                         );
 
-                        let mut resolved = false;
                         let item = peer_to_discovery_item(&peer_info, &discovered_endpoint_id);
                         if let Some(senders) = senders.get(&discovered_endpoint_id) {
                             trace!(?item, senders = senders.len(), "sending AddressLookupItem");
-                            resolved = true;
                             for sender in senders.values() {
                                 sender.send(Ok(item.clone())).await.ok();
                             }
                         }
-                        entry.or_insert(peer_info);
+                        entry.insert_entry(peer_info);
 
-                        // only send endpoints to the `subscriber` if they weren't explicitly resolved
-                        // in other words, endpoints sent to the `subscribers` should only be the ones that
-                        // have been "passively" discovered
-                        if !resolved {
-                            subscribers.send(DiscoveryEvent::Discovered {
-                                endpoint_info: item.endpoint_info().clone(),
-                                last_updated: item.last_updated(),
-                            });
-                        }
+                        // 主动解析和被动观察同时成立；解析不能抑制目录更新。
+                        subscribers.send(DiscoveryEvent::Discovered {
+                            endpoint_info: item.endpoint_info().clone(),
+                            last_updated: item.last_updated(),
+                        });
                     }
                     Message::Resolve(endpoint_id, sender) => {
                         let id = last_id + 1;
@@ -443,15 +441,25 @@ impl MdnsAddressLookup {
                     }
                     Message::Subscribe(subscriber) => {
                         trace!("Mdns Message::Subscribe");
+                        // 迟订阅获得当前快照；满队列时仍由后续广播刷新，目录另有有限期限。
+                        for (endpoint_id, peer) in &endpoint_addrs {
+                            let item = peer_to_discovery_item(peer, endpoint_id);
+                            let _ = subscriber.try_send(DiscoveryEvent::Discovered {
+                                endpoint_info: item.endpoint_info().clone(),
+                                last_updated: item.last_updated(),
+                            });
+                        }
                         subscribers.push(subscriber);
                     }
                 }
             }
         };
-        let handle =
-            task::spawn(address_lookup_fut.instrument(info_span!("swarm-discovery.actor")));
+        // 后台actor不继承短期建链span，也不在取消析构时跨subscriber释放其parent。
+        let handle = task::spawn(
+            address_lookup_fut.instrument(info_span!(parent: None, "swarm-discovery.actor")),
+        );
         Ok(Self {
-            handle: Arc::new(AbortOnDropHandle::new(handle)),
+            handle: Arc::new(Mutex::new(Some(AbortOnDropHandle::new(handle)))),
             sender: send,
             advertise,
             local_addrs,
@@ -467,6 +475,29 @@ impl MdnsAddressLookup {
             .await
             .ok();
         tokio_stream::wrappers::ReceiverStream::new(recv)
+    }
+
+    /// 显式停止所有克隆共用的服务，并等待 actor 析构；失败保留任务来源。
+    pub async fn shutdown(&self) -> Result<(), JoinError> {
+        let mut handle = self.handle.lock().await;
+        if let Some(task) = handle.take() {
+            task.abort();
+            match task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    /// 未完整构建或被直接丢弃时停止服务；持锁说明正常 shutdown 已持有停止责任。
+    pub fn abort(&self) {
+        if let Ok(handle) = self.handle.try_lock() {
+            if let Some(task) = &*handle {
+                task.abort();
+            }
+        }
     }
 
     fn spawn_discoverer(
@@ -503,8 +534,8 @@ impl MdnsAddressLookup {
                 discoverer = discoverer.with_addrs(addr.0, addr.1);
             }
         }
-        discoverer
-            .spawn(rt)
+        // acto会在创建时保存当前span；长期发现工作不能保存启动请求的parent。
+        dispatcher::with_default(&Dispatch::none(), || discoverer.spawn(rt))
             .map_err(|e| AddressLookupBuilderError::from_err("mdns", e))
     }
 
@@ -564,7 +595,12 @@ fn peer_to_discovery_item(peer: &Peer, endpoint_id: &EndpointId) -> AddressLooku
     data.set_user_data(user_data);
 
     let endpoint_info = EndpointInfo::from_parts(*endpoint_id, data);
-    AddressLookupItem::new(endpoint_info, NAME, None)
+    // 原观察时间而非缓存读取时间，消费者据此保持有限有效期。
+    let last_updated = SystemTime::now()
+        .checked_sub(peer.age())
+        .and_then(|updated| updated.duration_since(UNIX_EPOCH).ok())
+        .and_then(|updated| u64::try_from(updated.as_micros()).ok());
+    AddressLookupItem::new(endpoint_info, NAME, last_updated)
 }
 
 impl AddressLookup for MdnsAddressLookup {

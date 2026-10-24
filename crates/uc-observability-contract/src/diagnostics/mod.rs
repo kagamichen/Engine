@@ -2,6 +2,7 @@
 //!
 //! 本模块只负责约束记录形状，不安装 subscriber，也不选择或连接后端。
 
+use crate::wire_enum;
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,16 +16,49 @@ use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 pub mod connectivity;
 mod membership_recovery;
+mod network_scope;
 mod profile_upgrade_backup;
 pub use membership_recovery::{
     describe_membership_conflict, scope_membership_recovery_trigger, MembershipRecoveryObservation,
     MembershipRecoveryOutcome, MembershipRecoveryTrigger,
 };
+pub use network_scope::{within_network_scope, NETWORK_SCOPE_TARGET};
 pub use profile_upgrade_backup::{record_profile_upgrade_backup_failure, LOCAL_DIAGNOSTIC_TARGET};
 
 tokio::task_local! {
     static CONTINUATION: opentelemetry::Context;
+    static PENDING_INBOUND: tracing::Span;
     static OPERATION_FAILURE: std::cell::Cell<Option<DiagnosticErrorType>>;
+}
+
+/// Engine 提供尚未进入的完整能力 span；协议边界认证后才绑定远端关联。
+pub async fn scope_pending_inbound<F: Future>(span: tracing::Span, future: F) -> F::Output {
+    PENDING_INBOUND.scope(span, future).await
+}
+
+pub fn bind_authenticated_inbound_parent(parent: opentelemetry::Context) -> bool {
+    PENDING_INBOUND
+        .try_with(|span| span.set_parent(parent).is_ok())
+        .unwrap_or(false)
+}
+
+pub fn capture_inbound_observation() -> ObservationContext {
+    PENDING_INBOUND
+        .try_with(|span| {
+            let current = span.context();
+            ObservationContext(
+                opentelemetry::Context::new()
+                    .with_remote_span_context(current.span().span_context().clone()),
+            )
+        })
+        .unwrap_or_else(|_| ObservationContext::capture())
+}
+
+pub async fn scope_authenticated_inbound<F: Future>(future: F) -> F::Output {
+    match PENDING_INBOUND.try_with(Clone::clone) {
+        Ok(span) => future.instrument(span).await,
+        Err(_) => future.await,
+    }
 }
 
 /// 完整能力调用的诊断作用域；不改变业务错误或接口。
@@ -83,12 +117,33 @@ pub fn describe_membership_exchange(purpose: MembershipExchangePurpose, server: 
     );
 }
 
+#[derive(Clone)]
+struct AuthenticatedInboundParent(Arc<AtomicBool>);
+
 /// 只延续在线父关系，不持有原 span，不提供身份或字段读取接口。
 #[derive(Clone)]
 pub struct ObservationContext(opentelemetry::Context);
 
 impl ObservationContext {
+    /// 长期监听与后续独立请求不继承已经完成的短期动作。
+    pub fn independent() -> Self {
+        Self(opentelemetry::Context::new())
+    }
+    /// 只封存远端载体；调用方完成身份绑定后才能 scope，构造本身不采纳父关系。
+    pub fn from_remote_parent(parent: opentelemetry::Context) -> Self {
+        let parent = opentelemetry::Context::new()
+            .with_remote_span_context(parent.span().span_context().clone());
+        Self(parent.with_value(AuthenticatedInboundParent(Arc::new(AtomicBool::new(false)))))
+    }
     pub fn capture() -> Self {
+        if let Ok(parent) = CONTINUATION.try_with(Clone::clone) {
+            if parent
+                .get::<AuthenticatedInboundParent>()
+                .is_some_and(|marker| !marker.0.load(Ordering::Acquire))
+            {
+                return Self(parent);
+            }
+        }
         let current = tracing::Span::current().context();
         if current.span().span_context().is_valid() {
             // 只保留不可记录的父身份，避免延长原操作的生命周期。
@@ -103,6 +158,11 @@ impl ObservationContext {
 
     pub async fn scope<F: Future>(self, future: F) -> F::Output {
         CONTINUATION.scope(self.0, future).await
+    }
+
+    /// 将既有不透明关联延续到同步或阻塞工作，不读取内部状态。
+    pub fn sync_scope<T>(self, work: impl FnOnce() -> T) -> T {
+        CONTINUATION.sync_scope(self.0, work)
     }
 }
 
@@ -418,50 +478,29 @@ impl DiagnosticDomain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiagnosticOperation {
-    TaskShutdown,
-    SessionRecovery,
-    MembershipRecovery,
-    ClipboardSend,
-    ClipboardResend,
-    ClipboardCopyAndSync,
-    ClipboardPersist,
-    ClipboardWriteSystem,
-    ClipboardDispatch,
-    ClipboardReceive,
-    ClipboardAddressResolve,
-    ClipboardConnect,
-    SpaceAdmission,
-    MembershipHistorySync,
-    MembershipGroupUpdate,
-    NetworkTransport,
-    ProfileStorageUpgrade,
-    SessionLifecycle,
-}
-
-impl DiagnosticOperation {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ClipboardCopyAndSync => "clipboard.copy_and_sync",
-            Self::ClipboardSend => "clipboard.send",
-            Self::ClipboardResend => "clipboard.resend",
-            Self::ClipboardPersist => "clipboard.persist",
-            Self::ClipboardWriteSystem => "clipboard.write_system",
-            Self::ClipboardDispatch => "clipboard_dispatch",
-            Self::ClipboardReceive => "clipboard_receive",
-            Self::ClipboardAddressResolve => "clipboard_address_resolve",
-            Self::ClipboardConnect => "clipboard_connect",
-            Self::SpaceAdmission => "space_admission",
-            Self::MembershipHistorySync => "membership_history_sync",
-            Self::MembershipRecovery => "membership_recovery",
-            Self::MembershipGroupUpdate => "membership_group_update",
-            Self::NetworkTransport => "network_transport",
-            Self::ProfileStorageUpgrade => "profile_storage_upgrade",
-            Self::SessionLifecycle => "session_lifecycle",
-            Self::TaskShutdown => "runtime.shutdown_tasks",
-            Self::SessionRecovery => "runtime.recover_session",
-        }
+wire_enum! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DiagnosticOperation: &'static str {
+        ClipboardCopyAndSync => "clipboard.copy_and_sync",
+        ClipboardSend => "clipboard.send",
+        ClipboardResend => "clipboard.resend",
+        ClipboardPersist => "clipboard.persist",
+        ClipboardWriteSystem => "clipboard.write_system",
+        ClipboardDispatch => "clipboard_dispatch",
+        ClipboardReceive => "clipboard_receive",
+        ClipboardAddressResolve => "clipboard_address_resolve",
+        ClipboardConnect => "clipboard_connect",
+        SpaceAdmission => "space_admission",
+        MembershipHistorySync => "membership_history_sync",
+        MembershipRecovery => "membership_recovery",
+        MembershipGroupUpdate => "membership_group_update",
+        NetworkTransport => "network_transport",
+        ProfileStorageUpgrade => "profile_storage_upgrade",
+        SessionLifecycle => "session_lifecycle",
+        TaskShutdown => "runtime.shutdown_tasks",
+        SessionRecovery => "runtime.recover_session",
+        ClipboardRetryReceive => "clipboard.retry_receive",
+        ClipboardExportFile => "clipboard.export_file",
     }
 }
 
@@ -555,11 +594,19 @@ macro_rules! diagnostic_task_kinds {
 }
 
 diagnostic_task_kinds! {
+    /// 普通剪贴板共享拨号任务异常退出。
+    ClipboardConnectivityWorker => "clipboard_connectivity_worker",
+    BlobTransportWorker => "blob_transport_worker",
+    /// presence 完整收发与保留连接任务异常退出。
+    PresenceConnectivityWorker => "presence_connectivity_worker",
+    MembershipHistoryConnectivityWorker => "membership_history_connectivity_worker",
     ClipboardDeliveryRecord => "clipboard_delivery_record",
     ClipboardInboundOsWrite => "clipboard_inbound_os_write",
     ActiveClipboardConverge => "active_clipboard_converge",
     ClipboardDeferredDrain => "clipboard_deferred_drain",
     PairingMdnsForward => "pairing_mdns_forward",
+    /// 设备发现订阅或其共用 mDNS 服务的任务异常退出。
+    PeerDiscovery => "peer_discovery",
     MobileOutboundDispatch => "mobile_outbound_dispatch",
     /// Engine 公开操作的执行任务异常退出；调用方只收到稳定错误码 1108。
     EngineOperation => "engine_operation",
@@ -660,7 +707,7 @@ pub fn operation_span(context: OperationContext) -> tracing::Span {
         (DiagnosticOperation::NetworkTransport, DiagnosticRole::Sponsor) => {
             "pairing.receive_request"
         }
-        _ => context.operation.as_str(),
+        _ => context.operation.wire(),
     };
     let flow = matches!(
         (
@@ -686,7 +733,7 @@ pub fn operation_span(context: OperationContext) -> tracing::Span {
             otel.name = name,
             uc.display.name = tracing::field::Empty,
             uc.domain = context.domain.as_str(),
-            uc.operation = context.operation.as_str(),
+            uc.operation = context.operation.wire(),
             uc.role = context.role.as_str(),
             uc.flow.id = %FlowAttribute(flow),
             otel.kind = context.kind.as_str(),
@@ -701,7 +748,7 @@ pub fn operation_span(context: OperationContext) -> tracing::Span {
             otel.name = name,
             uc.display.name = tracing::field::Empty,
             uc.domain = context.domain.as_str(),
-            uc.operation = context.operation.as_str(),
+            uc.operation = context.operation.wire(),
             uc.role = context.role.as_str(),
             otel.kind = context.kind.as_str(),
             otel.status_code = tracing::field::Empty,
@@ -709,16 +756,29 @@ pub fn operation_span(context: OperationContext) -> tracing::Span {
             error.type = tracing::field::Empty,
         ),
     };
-    if !tracing::Span::current()
-        .context()
-        .span()
-        .span_context()
-        .is_valid()
-    {
-        if let Ok(parent) = CONTINUATION.try_with(Clone::clone) {
+    if let Ok(parent) = CONTINUATION.try_with(Clone::clone) {
+        // 认证远端只在本次完整 server 入口使用一次；内部工作继续自然父子关系。
+        let authenticated_entry = matches!(context.kind, DiagnosticSpanKind::Server)
+            && parent
+                .get::<AuthenticatedInboundParent>()
+                .is_some_and(|marker| !marker.0.swap(true, Ordering::AcqRel));
+        if authenticated_entry
+            || !tracing::Span::current()
+                .context()
+                .span()
+                .span_context()
+                .is_valid()
+        {
             let _ = span.set_parent(parent);
         }
     }
+    span
+}
+
+/// 用户稍后发起的动作使用全新的在线关联，不继承已经结束的发送或接收记录。
+pub fn independent_operation_span(context: OperationContext) -> tracing::Span {
+    let span = operation_span(context);
+    let _ = span.set_parent(opentelemetry::Context::new());
     span
 }
 
@@ -887,7 +947,7 @@ pub fn complete_operation(mut completion: OperationCompletion) {
     span.record("uc.outcome", outcome);
     let duration_ms = u64::try_from(completion.duration.as_millis()).unwrap_or(u64::MAX);
     let domain = completion.domain.as_str();
-    let operation = completion.operation.as_str();
+    let operation = completion.operation.wire();
     let role = completion.role.as_str();
     match completion.result {
         CompletionResult::Succeeded => {
@@ -955,7 +1015,7 @@ pub fn complete_unassociated_operation(completion: OperationCompletion) {
 fn emit_unassociated_operation(completion: OperationCompletion) {
     let duration_ms = u64::try_from(completion.duration.as_millis()).unwrap_or(u64::MAX);
     let domain = completion.domain.as_str();
-    let operation = completion.operation.as_str();
+    let operation = completion.operation.wire();
     let role = completion.role.as_str();
     match completion.result {
         CompletionResult::Conflict => record_unassociated_non_error_completion(

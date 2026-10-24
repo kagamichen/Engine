@@ -140,3 +140,9 @@ Rust 1.95.0：54 项绑定测试、真实 Host 烟测、workspace all-targets �
 
 
 输出类型修复结果：绑定 Rust 54 项、真实 N-API 单宿主和双独立进程、workspace all-targets、fmt、metadata、Rust 规范与架构预检通过；API 26 HAR/HAP 重建并校验成功。鸿蒙 A 上“历史恢复 → 读取剪贴板”完整正文一致，删除后的搜索及进程重启保持通过；同包系统导出的四文件 ZIP 独立逐项哈希比对通过。临时产品日志探针已移除。双模拟器新包互通、真机和完整发布矩阵仍待执行，不据此关闭本计划。
+
+## 上游 main 合并（rc.23）
+
+合并 origin/main 的 87 项提交：上游将 uc-infra 拆分为七个 infra crate，网络栈迁入 third_party/iroh 子模块。文件导出读取适配器随 fs 能力迁入 uc-infra-local，并为端口实现补充 uc-application 依赖（与其他 infra crate 的端口实现方向一致）。客户端契约的四个传输方法保留 transfer.rs 的 Operation 通道版本，删除上游重复实现与含 items 的 OhReceiveProgress/OhReceiveItem/OhWorkspaceConvergence；保留上游独有的 retryEntryReceive 与 OhReceiveRetryOutcome。恢复流程采用上游 RecoveryOutcome 结构，门控沿用显式意图 delivery_enabled(Automatic)，补 CancellationIncomplete 结果分支，移除上游已删除的设置分区。声明与烟测对齐合并后的 51 方法面（版本 rc.23），静态比对实现与声明零漂移。
+
+验证：workspace all-targets、uc-ohos-napi 54 项、绑定清单 Python 9 项、fmt 通过。注意：Rust 规范与架构门禁在 origin/main 即为红（local_file.rs、network_log.rs 等为上游原有违规，文件与上游逐字节一致），非本次合并引入；正式发布前需上游修复或明确豁免。W1.1 的“方法在主线可用”部分就此成立，发布（W1.2）、真实 N-API 烟测与设备验收仍待执行。

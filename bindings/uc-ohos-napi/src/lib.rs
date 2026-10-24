@@ -8,11 +8,13 @@ mod events;
 mod history;
 mod host;
 mod local_diagnostics;
+mod network_log;
 mod observability;
 mod security;
 mod settings;
 mod transfer;
 pub use local_diagnostics::*;
+pub use network_log::*;
 pub use security::{
     OhAdmissionRecovery, OhEncryptionState, OhProfileRecovery, OhSetupInvitation, OhSetupState,
 };
@@ -179,6 +181,13 @@ pub struct OhRelayOverview {
 pub struct OhLocalDevice {
     pub device_id: String,
     pub display_name: String,
+}
+
+#[napi(object)]
+pub struct OhReceiveRetryOutcome {
+    pub status: String,
+    pub attempt_id: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[napi(object)]

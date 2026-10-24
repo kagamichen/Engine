@@ -112,6 +112,28 @@ impl JoinerAdmission {
         ) || self.record.is_unbounded_late_join()
     }
 
+    /// 仅当处于 `RecoveryRequired` 终态时返回具体类别；其余 `needs_attention` 原因（如晚到加入）不携带类别。
+    pub const fn recovery_category(&self) -> Option<AdmissionRecoveryCategory> {
+        match &self.record.state {
+            SpaceAdmissionRecordState::Terminal(SpaceAdmissionTerminalState::RecoveryRequired(
+                state,
+            )) => Some(state.category),
+            _ => None,
+        }
+    }
+
+    /// 仅供测试模拟本次改动之前写入的历史记录（只有类别，没有 join_id）。
+    #[cfg(test)]
+    pub(crate) fn forget_recovery_join_id_for_test(mut self) -> Self {
+        if let SpaceAdmissionRecordState::Terminal(SpaceAdmissionTerminalState::RecoveryRequired(
+            state,
+        )) = &mut self.record.state
+        {
+            state.join_id = None;
+        }
+        self
+    }
+
     pub fn start_resolving_invitation(
         admission_id: SpaceAdmissionId,
         join_id: JoinId,
@@ -169,59 +191,67 @@ impl JoinerAdmission {
         self.record.admission_id()
     }
 
-    /// 返回本机加入动作的稳定标识，不暴露内部阶段表示。
-    pub fn join_id(&self) -> JoinId {
+    /// 返回本机加入动作的稳定标识，不暴露内部阶段表示。`RecoveryRequired` 终态只在
+    /// 转换时成功捕获了 join_id 才返回 `Some`；旧格式只保存了类别的历史记录没有
+    /// 可还原的 join_id，返回 `None` 而不是编造一个值或 panic。
+    pub fn join_id(&self) -> Option<JoinId> {
         match &self.record.state {
             SpaceAdmissionRecordState::Joiner(SpaceAdmissionJoinerState::ResolvingInvitation(
                 state,
-            )) => state.join_id,
+            )) => Some(state.join_id),
             SpaceAdmissionRecordState::Joiner(SpaceAdmissionJoinerState::ResolvedInvitation(
                 state,
-            )) => state.join_id,
+            )) => Some(state.join_id),
             SpaceAdmissionRecordState::Joiner(SpaceAdmissionJoinerState::Initiated(state)) => {
-                state.join_id
+                Some(state.join_id)
             }
             SpaceAdmissionRecordState::Joiner(SpaceAdmissionJoinerState::Candidate(state)) => {
-                state.join_id
+                Some(state.join_id)
             }
             SpaceAdmissionRecordState::Joiner(SpaceAdmissionJoinerState::Prepared(state)) => {
-                state.join_id
+                Some(state.join_id)
             }
             SpaceAdmissionRecordState::Joiner(SpaceAdmissionJoinerState::Committed(state)) => {
-                state.join_id
+                Some(state.join_id)
             }
             SpaceAdmissionRecordState::Joiner(SpaceAdmissionJoinerState::Applied(state)) => {
-                state.join_id
+                Some(state.join_id)
             }
             SpaceAdmissionRecordState::Joiner(SpaceAdmissionJoinerState::Activating(state)) => {
-                state.join_id
+                Some(state.join_id)
             }
             SpaceAdmissionRecordState::Joiner(SpaceAdmissionJoinerState::Cancelling(state)) => {
-                state.join_id
+                Some(state.join_id)
             }
             SpaceAdmissionRecordState::Terminal(SpaceAdmissionTerminalState::Active(
                 SpaceAdmissionActiveState::PendingSettlement(state),
-            )) => state.join_id,
+            )) => Some(state.join_id),
             SpaceAdmissionRecordState::Terminal(SpaceAdmissionTerminalState::Active(
                 SpaceAdmissionActiveState::Settled(state),
-            )) => state.join_id,
+            )) => Some(state.join_id),
             SpaceAdmissionRecordState::Terminal(SpaceAdmissionTerminalState::Superseded(state)) => {
-                match state {
+                Some(match state {
                     SpaceAdmissionSupersededState::Initiated { join_id }
                     | SpaceAdmissionSupersededState::Authenticated { join_id, .. } => *join_id,
                     SpaceAdmissionSupersededState::Candidate(state) => state.join_id,
-                }
+                })
             }
             SpaceAdmissionRecordState::Terminal(SpaceAdmissionTerminalState::Rejected(
                 SpaceAdmissionRejectedState::LocalJoiner(state),
-            )) => state.join_id,
+            )) => Some(state.join_id),
             SpaceAdmissionRecordState::Terminal(SpaceAdmissionTerminalState::Rejected(
                 SpaceAdmissionRejectedState::Joiner(state),
-            )) => state.join_id,
+            )) => Some(state.join_id),
             SpaceAdmissionRecordState::Terminal(SpaceAdmissionTerminalState::Terminated(state)) => {
-                state.join_id
+                Some(state.join_id)
             }
-            _ => unreachable!("JoinerAdmission only contains joiner-owned states"),
+            SpaceAdmissionRecordState::Terminal(SpaceAdmissionTerminalState::RecoveryRequired(
+                state,
+            )) => state.join_id,
+            // Sponsor 专属状态在 `JoinerAdmission` 上永远不可达（由 `try_from_record` 的
+            // 角色校验保证），这里返回 `None` 而不是 `unreachable!()`，不给这个公开入口
+            // 留下任何可被未来新状态打破的 panic 分支。
+            _ => None,
         }
     }
 
@@ -858,6 +888,47 @@ impl SponsorAdmission {
     ) -> Result<Option<SponsorAdmissionTransition>, SpaceAdmissionAggregateError> {
         self.record
             .mark_sponsor_confirmation_unconfirmed(now_ms)
+            .map(|transition| transition.map(SponsorAdmissionTransition::from_transition))
+    }
+
+    /// 早于尝试期限格式写入、至今没有期限的未终结记录；恢复流程据此选择收尾。
+    pub const fn is_legacy_unbounded(&self) -> bool {
+        self.record.is_legacy_unbounded_sponsor()
+    }
+
+    /// 未终结记录所处的阶段；已经终结的记录没有阶段。
+    pub const fn stage(&self) -> Option<SponsorRecordStage> {
+        match &self.record.state {
+            SpaceAdmissionRecordState::Sponsor(SpaceAdmissionSponsorState::Accepted(_)) => {
+                Some(SponsorRecordStage::Accepted)
+            }
+            SpaceAdmissionRecordState::Sponsor(SpaceAdmissionSponsorState::Candidate(_)) => {
+                Some(SponsorRecordStage::Candidate)
+            }
+            SpaceAdmissionRecordState::Sponsor(SpaceAdmissionSponsorState::Committed(_)) => {
+                Some(SponsorRecordStage::Committed)
+            }
+            SpaceAdmissionRecordState::Sponsor(SpaceAdmissionSponsorState::Applied(_)) => {
+                Some(SponsorRecordStage::Applied)
+            }
+            _ => None,
+        }
+    }
+
+    /// 需要向成员账本核对的这次准入的成员事实；`None` 表示这个状态从不写账本。
+    pub fn legacy_member_query(
+        &self,
+    ) -> Result<Option<LegacySponsorMemberQuery>, SpaceAdmissionAggregateError> {
+        self.record.legacy_sponsor_member_query()
+    }
+
+    /// 按成员账本的证据收尾旧记录；不属于旧格式未终结记录时不产生变化。
+    pub fn close_legacy(
+        self,
+        membership: LegacySponsorMembership,
+    ) -> Result<Option<SponsorAdmissionTransition>, SpaceAdmissionAggregateError> {
+        self.record
+            .close_legacy_sponsor(membership)
             .map(|transition| transition.map(SponsorAdmissionTransition::from_transition))
     }
 

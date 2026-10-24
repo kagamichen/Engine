@@ -4,7 +4,9 @@
 //! capture、history、restore、resource 与 live-index 入口。Engine 只选择
 //! 平台/存储 adapter，不再逐项拼装 Clipboard use case。
 
+use crate::clipboard::active::transport::ActivePullPreparationPort;
 use crate::clipboard::inbound::ClipboardReceiverPort;
+use crate::transfer::receive::materialization::InboundBlobFetcher;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,16 +18,15 @@ use uc_core::ports::blob::BlobTransferPort;
 use uc_core::ports::hidden_path::MarkHiddenPort;
 use uc_core::ports::inbound_file_target::ReserveInboundFileTargetPort;
 use uc_core::ports::{
-    ActiveClipboardDispatchPort, ActiveClipboardPullClientPort, ActiveClipboardPullServePort,
-    ActiveClipboardReceiverPort, EntryDeliveryRepositoryPort, PeerAddressRepositoryPort,
-    PeerReachabilityPort,
+    ActiveClipboardDispatchPort, ActiveClipboardPullClientPort, ActiveClipboardReceiverPort,
+    EntryDeliveryRepositoryPort, PeerAddressRepositoryPort, PeerReachabilityPort,
 };
 use uc_core::TaskRegistry;
 use uc_core::TrustedPeerRepositoryPort;
 
 use crate::clipboard::active::ClipboardSnapshotDeps;
 use crate::clipboard::active::{
-    build_active_clipboard_pull_serve_port, ActiveClipboardDeps, ActiveClipboardFacade,
+    build_active_clipboard_pull_preparation, ActiveClipboardDeps, ActiveClipboardFacade,
     ActiveClipboardLifecycle, ActiveClipboardLifecycleError, ActiveClipboardPullServeFacadeDeps,
     ActiveClipboardReconcileDeps, ActiveClipboardReconcileError, ActiveClipboardReconcileFacade,
 };
@@ -41,11 +42,12 @@ use crate::clipboard::local::{
 use crate::clipboard::outbound::{ClipboardOutboundDeps, ClipboardOutboundFacade};
 use crate::clipboard::resource::ResourceFacadeDeps;
 use crate::clipboard::sync::apply_inbound::{
-    ApplyInboundClipboardUseCase, InboundBlobFetcher, InboundCapture, InboundWrite,
+    ApplyInboundClipboardUseCase, InboundCapture, InboundWrite,
 };
 use crate::clipboard::sync::sync_runtime::{ClipboardSyncRuntime, ClipboardSyncRuntimeDeps};
 use crate::clipboard::write::{
-    ClipboardWriteCoordinator, LocalActiveRegisterAdvancer, RestoreBroadcastTrigger,
+    ClipboardWriteCoordinator, LocalActiveRegisterAdvancer, RestoreBroadcastReceiver,
+    RestoreBroadcastTrigger,
 };
 use crate::deps::{ApplicationDeps, CurrentSpaceMemberScopePort, IsSpaceUnlockedPort};
 use crate::facade::clipboard_history::ClipboardHistoryFacadeDeps;
@@ -62,6 +64,7 @@ use crate::transfer::file::assembly::FileTransferAssembly;
 use crate::transfer::file::assembly::StoreOnlyPullIntentDeps;
 use crate::transfer::file::assembly::{
     InboundMaterializerDeps, InboundReceiveIntentDeps, InteractiveReceiveIntentDeps,
+    ReceiveRetryIntentDeps,
 };
 
 /// Clipboard 运行所需的跨领域、被动装配输入。
@@ -223,6 +226,7 @@ impl ClipboardAssembly {
                 search_index: Arc::clone(&application.search.search_index),
                 event_repo: Arc::clone(&application.clipboard.clipboard_event_reader_repo),
                 entry_file_set_repo: Arc::clone(&application.storage.entry_file_set_repo),
+                history_entry_tags: Arc::clone(&application.storage.history_entry_tags),
             }));
 
         Self {
@@ -294,6 +298,9 @@ impl ClipboardAssembly {
             .file_transfer
             .interactive_receive(InteractiveReceiveIntentDeps {
                 common: InboundReceiveIntentDeps {
+                    snapshot: self.snapshot_deps(),
+                    identity: self.deps.clipboard.entry_ports.get_snapshot_hash.clone(),
+                    scope: session.member_scope.clone(),
                     entry_repo: Arc::clone(&self.deps.clipboard.entry_ports.find_by_snapshot_hash),
                     capture: Arc::clone(&self.capture_use_case) as Arc<dyn InboundCapture>,
                     materializer: InboundMaterializerDeps {
@@ -367,8 +374,8 @@ impl ClipboardAssembly {
     pub fn active_pull_serve(
         &self,
         blob_publisher: Arc<BlobTransferFacade>,
-    ) -> Arc<dyn ActiveClipboardPullServePort> {
-        build_active_clipboard_pull_serve_port(ActiveClipboardPullServeFacadeDeps {
+    ) -> Arc<dyn ActivePullPreparationPort> {
+        build_active_clipboard_pull_preparation(ActiveClipboardPullServeFacadeDeps {
             entry_lookup: Arc::clone(&self.deps.clipboard.entry_ports.find_by_snapshot_hash),
             settings: Arc::clone(&self.deps.settings),
             transfer_cipher: Arc::clone(&self.deps.security.transfer_cipher),
@@ -386,7 +393,7 @@ impl ClipboardAssembly {
             return Err(ActiveClipboardStartError::BackgroundNotReady);
         }
 
-        let pull_apply = self.store_only_pull(session.pull_adapters);
+        let pull_apply = self.store_only_pull(session.pull_adapters, session.member_scope.clone());
         let facade = Arc::new(ActiveClipboardFacade::new(ActiveClipboardDeps {
             receiver: session.receiver,
             dispatch: session.dispatch,
@@ -419,9 +426,13 @@ impl ClipboardAssembly {
     fn store_only_pull(
         &self,
         adapters: ClipboardInboundAdapters,
+        scope: Arc<dyn CurrentSpaceMemberScopePort>,
     ) -> Arc<dyn InboundClipboardApplyPort> {
         self.file_transfer.store_only_pull(StoreOnlyPullIntentDeps {
             common: InboundReceiveIntentDeps {
+                snapshot: self.snapshot_deps(),
+                identity: self.deps.clipboard.entry_ports.get_snapshot_hash.clone(),
+                scope,
                 entry_repo: Arc::clone(&self.deps.clipboard.entry_ports.find_by_snapshot_hash),
                 capture: Arc::clone(&self.capture_use_case) as Arc<dyn InboundCapture>,
                 materializer: InboundMaterializerDeps {
@@ -461,6 +472,8 @@ impl ClipboardAssembly {
         blob_transfer: Option<Arc<dyn BlobTransferPort>>,
     ) -> Arc<ClipboardHistoryFacade> {
         Arc::new(ClipboardHistoryFacade::new(ClipboardHistoryFacadeDeps {
+            resource_snapshot: Arc::clone(&self.deps.clipboard.resource_snapshot),
+            receive_work: self.file_transfer.receive_registry(),
             file_references: Arc::clone(&self.deps.clipboard.history_file_references),
             entry_ports: self.deps.clipboard.entry_ports.clone(),
             selection_repo: Arc::clone(&self.deps.clipboard.selection_repo),
@@ -478,6 +491,7 @@ impl ClipboardAssembly {
             device_identity: Arc::clone(&self.deps.device.device_identity),
             clock: Arc::clone(&self.deps.system.clock),
             cache_fs: Arc::clone(&self.deps.system.cache_fs),
+            history_tag_store: Arc::clone(&self.deps.storage.history_tag_store),
         }))
     }
 
@@ -500,6 +514,27 @@ impl ClipboardAssembly {
             write_coordinator: Arc::clone(&self.write_coordinator),
             integration_mode,
         }))
+    }
+
+    pub(crate) fn receive_retry_deps(
+        &self,
+        materializer: InboundMaterializerDeps,
+        scope: Arc<dyn CurrentSpaceMemberScopePort>,
+    ) -> ReceiveRetryIntentDeps {
+        ReceiveRetryIntentDeps {
+            common: InboundReceiveIntentDeps {
+                snapshot: self.snapshot_deps(),
+                identity: self.deps.clipboard.entry_ports.get_snapshot_hash.clone(),
+                scope,
+                entry_repo: Arc::clone(&self.deps.clipboard.entry_ports.find_by_snapshot_hash),
+                capture: self.capture_use_case.clone(),
+                materializer,
+                host_event_emitter: self.host_event_bus.clone(),
+                search_live_index: self.live_index.clone(),
+                availability: self.deps.clipboard.entry_ports.availability.clone(),
+                entry_identity_coordinator: self.entry_identity.clone(),
+            },
+        }
     }
 
     fn snapshot_deps(&self) -> ClipboardSnapshotDeps {
@@ -549,7 +584,7 @@ impl ActiveClipboardSession {
 
     pub fn attach_restore_broadcast(
         &self,
-        rx: tokio::sync::mpsc::UnboundedReceiver<crate::clipboard::write::RestoreBroadcastRequest>,
+        rx: RestoreBroadcastReceiver,
     ) -> Result<(), ActiveClipboardLifecycleError> {
         self.lifecycle.attach_restore_broadcast(rx)
     }

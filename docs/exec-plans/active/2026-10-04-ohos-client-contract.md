@@ -145,4 +145,4 @@ Rust 1.95.0：54 项绑定测试、真实 Host 烟测、workspace all-targets �
 
 合并 origin/main 的 87 项提交：上游将 uc-infra 拆分为七个 infra crate，网络栈迁入 third_party/iroh 子模块。文件导出读取适配器随 fs 能力迁入 uc-infra-local，并为端口实现补充 uc-application 依赖（与其他 infra crate 的端口实现方向一致）。客户端契约的四个传输方法保留 transfer.rs 的 Operation 通道版本，删除上游重复实现与含 items 的 OhReceiveProgress/OhReceiveItem/OhWorkspaceConvergence；保留上游独有的 retryEntryReceive 与 OhReceiveRetryOutcome。恢复流程采用上游 RecoveryOutcome 结构，门控沿用显式意图 delivery_enabled(Automatic)，补 CancellationIncomplete 结果分支，移除上游已删除的设置分区。声明与烟测对齐合并后的 51 方法面（版本 rc.23），静态比对实现与声明零漂移。
 
-验证：workspace all-targets、uc-ohos-napi 54 项、绑定清单 Python 9 项、fmt 通过。注意：Rust 规范与架构门禁在 origin/main 即为红（local_file.rs、network_log.rs 等为上游原有违规，文件与上游逐字节一致），非本次合并引入；正式发布前需上游修复或明确豁免。W1.1 的“方法在主线可用”部分就此成立，发布（W1.2）、真实 N-API 烟测与设备验收仍待执行。
+验证：workspace all-targets、uc-ohos-napi 54 项、绑定清单 Python 9 项、fmt 通过。注意：Rust 规范与架构门禁在 origin/main 即为红（local_file.rs、network_log.rs 等为上游原有违规，文件与上游逐字节一致），非本次合并引入；正式发布前需上游修复或明确豁免。合并后在 macOS 宿主复跑三件套真实 N-API 烟测（host_smoke、host_failure_smoke、p2p_smoke）全部通过；host_failure_smoke 的阻塞文件随上游 58f287c 迁至 <private_data>/logs。W1.1 就此成立，发布（W1.2）与设备验收仍待执行。

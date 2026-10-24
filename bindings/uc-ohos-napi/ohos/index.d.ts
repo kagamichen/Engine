@@ -415,8 +415,8 @@ export interface OhEngine {
   resendEntry(entryId: string, targetDevices: string[]): Promise<OhResendOutcome>
   queryEntryReceiveProgress(entryId: string): Promise<OhReceiveProgress | null>
   listEntryReceiveProgress(): Promise<OhReceiveProgress[]>
-  cancelEntryReceive(entryId: string, attemptId: string): Promise<'cancelled' | 'not_receiving' | 'too_late' | 'already_terminal' | 'superseded'>
-  cancelInboundTransfer(transferId: string): Promise<'cancelled' | 'not_inflight'>
+  cancelEntryReceive(entryId: string, attemptId: string): Promise<'cancelled' | 'not_receiving' | 'too_late' | 'already_terminal' | 'superseded' | 'cancellation_incomplete'>
+  cancelInboundTransfer(transferId: string): Promise<'cancelled' | 'not_inflight' | 'cancellation_incomplete'>
   queryMemberSyncPreferences(deviceId: string): Promise<OhSyncPreferences>
   updateMemberSyncPreferences(deviceId: string, preferences: OhSyncPreferences): Promise<OhSyncPreferences>
   queryHistory(cursor: string | null, limit: number, query: string | null): Promise<OhHistoryPage>
@@ -444,12 +444,6 @@ export interface OhEngine {
   removeMember(deviceId: string): Promise<string>
   /** 只提交完整重试意图；accepted 表示新尝试已接受，最终结果通过接收进度查询。 */
   retryEntryReceive(entryId: string, expectedAttemptId: string, itemIds: string[]): Promise<OhReceiveRetryOutcome>
-  /** 取消整个接收尝试；cancellation_incomplete 表示实际清理仍在进行。 */
-  cancelEntryReceive(entryId: string, attemptId: string): Promise<string>
-  /** 用户主动取消单项；cancellation_incomplete 不等于已取消。 */
-  cancelInboundTransfer(transferId: string): Promise<string>
-  queryEntryReceiveProgress(entryId: string): Promise<OhReceiveProgress | null>
-  listEntryReceiveProgress(): Promise<OhReceiveProgress[]>
   queryActiveClipboard(): Promise<OhActiveClipboard | null>
   lifecycleState(): Promise<string>
   suspend(): Promise<void>

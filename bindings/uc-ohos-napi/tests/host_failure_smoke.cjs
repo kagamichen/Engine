@@ -43,8 +43,10 @@ async function main() {
   };
 
   try {
-    fs.mkdirSync(host.cacheDirectory, { recursive: true });
-    fs.writeFileSync(path.join(host.cacheDirectory, 'logs'), 'blocks log directory');
+    fs.mkdirSync(host.privateDataDirectory, { recursive: true });
+    // Mobile Engine logs live under <private_data>/logs since 58f287c; a plain
+    // file at that path keeps the local log writer unavailable.
+    fs.writeFileSync(path.join(host.privateDataDirectory, 'logs'), 'blocks log directory');
     const setup = addon.installProcessObservability(
       {
         serviceVersion: '1.2.3',
